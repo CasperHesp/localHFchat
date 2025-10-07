@@ -10,6 +10,10 @@ from pydantic import BaseModel
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 from transformers import StoppingCriteria, StoppingCriteriaList
+try:
+    from transformers import BitsAndBytesConfig
+except ImportError:  # Optional dependency
+    BitsAndBytesConfig = None
 
 # ====== Speed & device setup ======
 MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen2.5-0.5B-Instruct")
@@ -18,10 +22,13 @@ IS_CUDA = torch.cuda.is_available()
 
 if IS_CUDA:
     DEVICE = torch.device("cuda")
+    DEVICE_TYPE = "cuda"
 elif IS_MPS:
     DEVICE = torch.device("mps")
+    DEVICE_TYPE = "mps"
 else:
     DEVICE = torch.device("cpu")
+    DEVICE_TYPE = "cpu"
 
 if IS_CUDA or IS_MPS:
     DTYPE = torch.float16
@@ -33,6 +40,22 @@ else:
 _NUM_THREADS = int(os.environ.get("NUM_THREADS", str(max(1, (os.cpu_count() or 4) - 1))))
 torch.set_num_threads(_NUM_THREADS)
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+
+def _env_flag(name: str, default: str = "1") -> bool:
+    val = os.environ.get(name, default)
+    return str(val).strip().lower() not in {"0", "false", "off", "no"}
+
+
+OPTIMIZATION_INFO = {
+    "device_type": DEVICE_TYPE,
+    "dtype": str(DTYPE),
+    "quantization": "none",
+    "bettertransformer": False,
+    "compiled": False,
+    "matmul_precision": None,
+    "interop_threads": None,
+}
 
 # ====== Dynamic inference profile ======
 def _infer_profile(model_id: str) -> Dict[str, Any]:
@@ -152,6 +175,7 @@ PROFILE_INFO.update(
         "cuda": IS_CUDA,
     }
 )
+PROFILE_INFO.setdefault("optimizations", dict(OPTIMIZATION_INFO))
 
 MODEL_CTX_LIMIT = int(PROFILE_INFO.get("max_context_tokens", 2048))
 
@@ -270,18 +294,134 @@ _READY = False
 _LAST_ERROR = None
 
 def _load_pipeline(model_id: str):
-    global _PIPE, _TOKENIZER, _READY, _LAST_ERROR, MODEL_CTX_LIMIT, MAX_NEW_CAP
+    global _PIPE, _TOKENIZER, _READY, _LAST_ERROR, MODEL_CTX_LIMIT, MAX_NEW_CAP, OPTIMIZATION_INFO
     try:
         tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, use_fast=True)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            trust_remote_code=True,
-            torch_dtype=DTYPE,
-            low_cpu_mem_usage=True,
-            use_safetensors=True,
-        )
+
+        optimization = {
+            "device_type": DEVICE_TYPE,
+            "dtype": str(DTYPE),
+            "quantization": "none",
+            "bettertransformer": False,
+            "compiled": False,
+            "matmul_precision": None,
+            "interop_threads": None,
+        }
+
+        if DEVICE_TYPE == "cpu":
+            matmul_precision = os.environ.get("TORCH_FLOAT32_MATMUL_PRECISION", "medium")
+            try:
+                torch.set_float32_matmul_precision(matmul_precision)
+                optimization["matmul_precision"] = matmul_precision
+            except Exception as err:
+                print(f"[startup] torch.set_float32_matmul_precision failed: {err}", flush=True)
+            interop_env = os.environ.get("NUM_INTEROP_THREADS")
+            try:
+                interop_threads = int(interop_env) if interop_env is not None else _NUM_THREADS
+            except ValueError:
+                print(
+                    f"[startup] Invalid NUM_INTEROP_THREADS={interop_env!r}, using {_NUM_THREADS}",
+                    flush=True,
+                )
+                interop_threads = _NUM_THREADS
+            if hasattr(torch, "set_num_interop_threads"):
+                try:
+                    torch.set_num_interop_threads(max(1, interop_threads))
+                    optimization["interop_threads"] = max(1, interop_threads)
+                except Exception as err:
+                    print(f"[startup] torch.set_num_interop_threads failed: {err}", flush=True)
+
+        quantization_candidates: List[str] = []
+        if DEVICE_TYPE == "cuda" and BitsAndBytesConfig is not None and _env_flag("ENABLE_BNB_QUANTIZATION", "1"):
+            preferred = os.environ.get("QUANTIZATION_MODE", "4bit").strip().lower()
+            if preferred in {"4bit", "8bit"}:
+                quantization_candidates = [preferred, "8bit" if preferred == "4bit" else "4bit"]
+            else:
+                quantization_candidates = ["4bit", "8bit"]
+
+        model = None
+        quantization_error: Optional[Exception] = None
+        for mode in quantization_candidates:
+            try:
+                if mode == "4bit":
+                    quant_config = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_compute_dtype=torch.float16,
+                        bnb_4bit_use_double_quant=True,
+                        bnb_4bit_quant_type="nf4",
+                    )
+                elif mode == "8bit":
+                    quant_config = BitsAndBytesConfig(load_in_8bit=True)
+                else:
+                    continue
+
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_id,
+                    trust_remote_code=True,
+                    low_cpu_mem_usage=True,
+                    use_safetensors=True,
+                    quantization_config=quant_config,
+                    device_map="auto",
+                )
+                optimization["quantization"] = f"bnb-{mode}"
+                break
+            except (ValueError, FileNotFoundError, OSError) as err:
+                quantization_error = err
+                print(
+                    f"[startup] Quantized load ({mode}) unavailable, will retry/fallback: {err}",
+                    flush=True,
+                )
+                model = None
+            except Exception as err:
+                quantization_error = err
+                print(f"[startup] Quantized load ({mode}) failed: {err}", flush=True)
+                model = None
+
+        if model is None:
+            if quantization_candidates and quantization_error is not None:
+                print("[startup] Falling back to full-precision weights.", flush=True)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                trust_remote_code=True,
+                torch_dtype=DTYPE,
+                low_cpu_mem_usage=True,
+                use_safetensors=True,
+            )
+            model.to(DEVICE)
+
         model.eval()
-        model.to(DEVICE)
+
+        if _env_flag("ENABLE_BETTERTRANSFORMER", "1") and hasattr(model, "to_bettertransformer"):
+            try:
+                model = model.to_bettertransformer()
+                optimization["bettertransformer"] = True
+            except Exception as err:
+                print(f"[startup] to_bettertransformer() failed: {err}", flush=True)
+
+        def _torch_version_at_least(major: int, minor: int) -> bool:
+            ver_str = torch.__version__.split("+")[0]
+            parts = ver_str.split(".")
+            try:
+                ver_nums = [int(p) for p in parts[:3]]
+            except ValueError:
+                ver_nums = [0, 0, 0]
+            ver_nums += [0] * (3 - len(ver_nums))
+            return (ver_nums[0], ver_nums[1]) >= (major, minor)
+
+        if (
+            _env_flag("ENABLE_TORCH_COMPILE", "0")
+            and hasattr(torch, "compile")
+            and _torch_version_at_least(2, 1)
+            and optimization.get("quantization") == "none"
+        ):
+            try:
+                model = torch.compile(model)
+                optimization["compiled"] = True
+            except Exception as err:
+                print(f"[startup] torch.compile failed: {err}", flush=True)
+
+        OPTIMIZATION_INFO = optimization
+        PROFILE_INFO["optimizations"] = dict(optimization)
         ctx_limit = int(getattr(model.config, "max_position_embeddings", MODEL_CTX_LIMIT))
         MODEL_CTX_LIMIT = ctx_limit
         ctx_cap = max(128, ctx_limit - 128)
@@ -311,7 +451,11 @@ def _load_pipeline(model_id: str):
         _TOKENIZER = tok
         _READY = True
         _LAST_ERROR = None
-        print(f"[startup] Model loaded: {model_id} on {DEVICE} (MPS={IS_MPS})", flush=True)
+        print(
+            f"[startup] Model loaded: {model_id} on {DEVICE} (MPS={IS_MPS})"
+            f" optimizations={OPTIMIZATION_INFO}",
+            flush=True,
+        )
     except Exception as e:
         _READY = False
         _LAST_ERROR = str(e)
@@ -390,6 +534,8 @@ def health():
     profile["modes"] = profile_modes
     profile.setdefault("max_context_tokens", MODEL_CTX_LIMIT)
     profile.setdefault("default_mode", DEFAULT_MODE)
+    if "optimizations" not in profile:
+        profile["optimizations"] = dict(OPTIMIZATION_INFO)
     return {
         "ok": True,
         "model_id": MODEL_ID,
@@ -400,6 +546,7 @@ def health():
         "threads": _NUM_THREADS,
         "mps": IS_MPS,
         "cuda": IS_CUDA,
+        "optimizations": dict(OPTIMIZATION_INFO),
         "profile": profile,
     }
 
