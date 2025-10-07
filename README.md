@@ -36,7 +36,7 @@ project-root/
   Dockerfile
   docker-compose.yml
   run_macos.sh
-  requirements*.txt
+  requirements.txt
 ```
 
 * **backend/app/main.py** — FastAPI app. Loads a small HF chat model; merges context **as data** (system → company → selected dropdown file → optional session memory); adds guardrails (timeout, no-repeat, tuned sampling); serves `/static` + UI.
@@ -65,7 +65,7 @@ project-root/
 
 ## Design choices
 
-* **[EDGE:contextually compressed data]**: Behavior steered by editable text/JSON files; no rebuilds to change domain knowledge.
+* **[EDGE:contextually compressed data]**: Behavior steered by editable text/JSON files; no rebuilds to change domain knowledge. Sensitive data can be safely and bijectively pseudonymised elsewhere (i.e.,ensuring security & recoverability).
 * **[CORE: on-device ergonomics]:** Tuned decoding (`temperature=0.3`, `top_p=0.95`, `top_k=40`, `repetition_penalty=1.05`), **auto token budgeting**, `no_repeat_ngram_size=3`, **timeout guard** (default 12s) to reduce stalls/loops.
 * **[SENSE: responsive UI/UX]**: Markdown, spinner, **Stop**, intro per context, **10s kickstart**, export/import, dark mode, session memory with summarization.
 
@@ -94,14 +94,11 @@ uvicorn backend.app.main:app --host 0.0.0.0 --port "$PORT"
 
 ## Concluding note
 
-Several app/model parameter toggles are intentionally hidden in the UI to keep things simple for demo purposes; they can be exposed easily if needed (e.g., temperature, top-p, repetition penalties, token limits, timeouts, context knobs).
+Various app/model parameter toggles are intentionally hidden in the UI to keep things simple for demo purposes; they can be exposed easily if needed (e.g., temperature, top-p, repetition penalties, token limits, timeouts, context knobs).
 
 Next steps / roadmapfocus on device-, OS-, and cluster-level optimizations, including:
 
 * Edge (pre-)computing for faster local response and reduced bandwidth,
-
 * Federated learning for privacy-preserving adaptation,
-
 * Invertible masking / pseudonymisation to protect sensitive fields during processing.
-
 * These approaches can be explored once implementation requirements and constraints are clearer.
