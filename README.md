@@ -90,3 +90,18 @@ export PYTORCH_ENABLE_MPS_FALLBACK=1
 uvicorn backend.app.main:app --host 0.0.0.0 --port "$PORT"
 # open http://localhost:$PORT
 ```
+
+
+## Concluding note
+
+Several app/model parameter toggles are intentionally hidden in the UI to keep things simple for demo purposes; they can be exposed easily if needed (e.g., temperature, top-p, repetition penalties, token limits, timeouts, context knobs).
+
+Next steps / roadmapfocus on device-, OS-, and cluster-level optimizations, including:
+
+* Edge (pre-)computing for faster local response and reduced bandwidth,
+
+* Federated learning for privacy-preserving adaptation,
+
+* Invertible masking / pseudonymisation to protect sensitive fields during processing.
+
+* These approaches can be explored once implementation requirements and constraints are clearer.
