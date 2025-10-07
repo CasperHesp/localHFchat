@@ -55,19 +55,19 @@ project-root/
 
 ---
 
-## Technologies used
+## Tech summary
 
 * **Backend:** FastAPI + Uvicorn, Hugging Face **Transformers**, **PyTorch** (+ Apple **MPS** on macOS), Accelerate
 * **Frontend:** custom vanilla **HTML/CSS/JS** (no UI framework)
-* **Container:** Docker, docker-compose
+* **Container:** Docker, docker-compose + edge-(pre-)computation
 
 ---
 
-## Creative choices
+## Design choices
 
-* **Context as data** — Behavior steered by editable text/JSON files; no rebuilds to change domain knowledge.
-* **Small-model ergonomics** — Tuned decoding (`temperature=0.3`, `top_p=0.95`, `top_k=40`, `repetition_penalty=1.05`), **auto token budgeting**, `no_repeat_ngram_size=3`, **timeout guard** (default 12s) to reduce stalls/loops.
-* **Helpful UX** — Markdown, spinner, **Stop**, intro per context, **10s kickstart**, export/import, dark mode, session memory with summarization.
+* **[EDGE:contextually compressed data]**: Behavior steered by editable text/JSON files; no rebuilds to change domain knowledge.
+* **[CORE: on-device ergonomics]:** Tuned decoding (`temperature=0.3`, `top_p=0.95`, `top_k=40`, `repetition_penalty=1.05`), **auto token budgeting**, `no_repeat_ngram_size=3`, **timeout guard** (default 12s) to reduce stalls/loops.
+* **[SENSE: responsive UI/UX]**: Markdown, spinner, **Stop**, intro per context, **10s kickstart**, export/import, dark mode, session memory with summarization.
 
 ---
 
