@@ -49,7 +49,7 @@ uvicorn backend.app.main:app --host 0.0.0.0 --port "$PORT"
 # open http://localhost:$PORT
 ```
 
-> Tip: use the included `run_macos.sh` (if present) to auto-install from requirements, pick a random free port, enable MPS, and open your browser:
+> Tip: use the included `run_macos.sh` to auto-install from requirements, pick a random free port, enable MPS, and open your browser:
 >
 > ```bash
 > chmod +x run_macos.sh
