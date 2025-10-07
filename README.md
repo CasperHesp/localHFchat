@@ -1,6 +1,6 @@
 # Brainbay Local HF Chat — Short Manual
 
-## Build, start & run (Docker, recommended)
+## Build, start & run (Docker)
 
 ```bash
 # Build & start (publishes a RANDOM host port for container port 8000)
@@ -13,11 +13,11 @@ docker compose port chatapp 8000
 
 ## What it is
 
-A **fully local** chat app: **FastAPI** backend + minimalist **vanilla** frontend, powered by a **public Hugging Face** chat model. It’s Brainbay-aware via simple text files, supports small models, and includes UX niceties (Markdown, spinner, Stop, intro/kickstart prompts, session memory). Designed to run in Docker or natively on macOS (Apple Silicon with MPS).
+A **fully local** chat app: **FastAPI** backend + minimalist **vanilla** frontend, powered by a **public Hugging Face** chat model. It has augmented awareness of BrainBay & real estate consultancy thanks to edge-(pre-)computing: larger LLM models were used to scrape domain-specific contextual data on Brainbay, the real estate market, its geographical depencencies, and matching patterns. These were condensed into local contextual files, which could be expanded to include more sensitive internal data. The fully functional app has been tested with small models compatible with laptop-level compute (current default: Qwen/Qwen2.5-3B-Instruct), and includes basic UI/UX (Markdown, spinner, Stop, intro/kickstart prompts, session memory). Designed to run in Docker or natively on macOS (Apple Silicon with MPS).
 
 ---
 
-## Project structure — and why each file exists
+## Project structure
 
 ```
 project-root/
