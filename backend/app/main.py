@@ -10,9 +10,17 @@ from pydantic import BaseModel
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 from transformers import StoppingCriteria, StoppingCriteriaList
+try:
+    from transformers import BitsAndBytesConfig
+except ImportError:  # pragma: no cover - optional dependency at runtime
+    BitsAndBytesConfig = None
 
 # ====== Speed & device setup ======
 MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen2.5-0.5B-Instruct")
+MODEL_QUANTIZATION = os.environ.get("MODEL_QUANTIZATION", "auto").strip().lower()
+if MODEL_QUANTIZATION not in {"auto", "full", "4bit"}:
+    MODEL_QUANTIZATION = "auto"
+MIN_FULL_PRECISION_VRAM_GB = float(os.environ.get("MIN_FULL_PRECISION_VRAM_GB", "8"))
 IS_MPS = torch.backends.mps.is_available()
 DEVICE = torch.device("mps") if IS_MPS else torch.device("cpu")
 DTYPE = torch.float16 if IS_MPS else torch.float32
@@ -134,32 +142,158 @@ _PIPE = None
 _TOKENIZER = None
 _READY = False
 _LAST_ERROR = None
+_ACTIVE_PRECISION = "full"
+_HARDWARE_STATE: Dict[str, Optional[float]] = {
+    "cpu_capability": None,
+    "cpu_bf16": None,
+    "vram_gb": None,
+    "quantization_mode": MODEL_QUANTIZATION,
+    "active_precision": _ACTIVE_PRECISION,
+}
+
+
+def _detect_cpu_capability() -> str:
+    try:
+        return str(torch.backends.cpu.get_cpu_capability())
+    except Exception:
+        return "unknown"
+
+
+def _cpu_supports_bf16() -> bool:
+    try:
+        return bool(getattr(torch.cpu.amp, "bfloat16_is_available", lambda: False)())
+    except Exception:
+        return False
+
+
+def _detect_vram_gb() -> Optional[float]:
+    try:
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(0)
+            return round(props.total_memory / (1024 ** 3), 2)
+    except Exception:
+        pass
+    return None
+
+
+def _should_quantize(cpu_cap: str, cpu_bf16: bool, vram_gb: Optional[float]) -> bool:
+    if MODEL_QUANTIZATION == "4bit":
+        return True
+    if MODEL_QUANTIZATION == "full":
+        return False
+
+    # AUTO mode heuristics
+    if vram_gb is not None and vram_gb < MIN_FULL_PRECISION_VRAM_GB:
+        return True
+
+    if not torch.cuda.is_available() and not IS_MPS:
+        has_avx512 = "AVX512" in (cpu_cap or "").upper()
+        if not (has_avx512 and cpu_bf16):
+            return True
+
+    return False
+
+
+def _infer_profile() -> Dict[str, Optional[float]]:
+    precision = _ACTIVE_PRECISION
+    if precision == "4bit":
+        est_tps = 18.0
+        latency_ms = 450.0
+    else:
+        est_tps = 10.0
+        latency_ms = 650.0
+
+    if torch.cuda.is_available():
+        est_tps *= 1.4
+        latency_ms *= 0.7
+    elif IS_MPS:
+        est_tps *= 1.2
+        latency_ms *= 0.85
+
+    profile = {
+        "precision": precision,
+        "quantization": MODEL_QUANTIZATION,
+        "estimated_tokens_per_second": round(est_tps, 2),
+        "estimated_latency_ms": round(latency_ms, 1),
+        "cpu_capability": _HARDWARE_STATE.get("cpu_capability"),
+        "cpu_bf16": _HARDWARE_STATE.get("cpu_bf16"),
+        "vram_gb": _HARDWARE_STATE.get("vram_gb"),
+    }
+    return profile
 
 def _load_pipeline(model_id: str):
-    global _PIPE, _TOKENIZER, _READY, _LAST_ERROR
+    global _PIPE, _TOKENIZER, _READY, _LAST_ERROR, _ACTIVE_PRECISION, _HARDWARE_STATE
     try:
-        tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, use_fast=True)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
+        cpu_cap = _detect_cpu_capability()
+        cpu_bf16 = _cpu_supports_bf16()
+        vram_gb = _detect_vram_gb()
+        quantize = _should_quantize(cpu_cap, cpu_bf16, vram_gb)
+
+        load_kwargs = dict(
             trust_remote_code=True,
-            torch_dtype=DTYPE,
             low_cpu_mem_usage=True,
             use_safetensors=True,
         )
+
+        if quantize:
+            _ACTIVE_PRECISION = "4bit"
+            compute_dtype = torch.float16 if DTYPE == torch.float16 else torch.float32
+            if BitsAndBytesConfig is not None:
+                load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=compute_dtype,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                )
+            else:
+                load_kwargs["load_in_4bit"] = True
+            if torch.cuda.is_available() or IS_MPS:
+                load_kwargs["device_map"] = "auto"
+        else:
+            _ACTIVE_PRECISION = "full"
+            load_kwargs["torch_dtype"] = DTYPE
+
+        tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, use_fast=True)
+        model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
         model.eval()
-        model.to(DEVICE)
+        if not quantize:
+            model.to(DEVICE)
+
         # Ensure eos/pad are set to avoid hanging on some models
         if model.config.eos_token_id is None and tok.eos_token_id is not None:
             model.config.eos_token_id = tok.eos_token_id
         if model.config.pad_token_id is None:
             model.config.pad_token_id = tok.eos_token_id or tok.pad_token_id
 
-        text_gen = pipeline("text-generation", model=model, tokenizer=tok, device=DEVICE)
+        if quantize:
+            if torch.cuda.is_available():
+                pipe_device = 0
+            elif IS_MPS:
+                pipe_device = DEVICE
+            else:
+                pipe_device = -1
+        else:
+            pipe_device = DEVICE
+
+        text_gen = pipeline("text-generation", model=model, tokenizer=tok, device=pipe_device)
         _PIPE = text_gen
         _TOKENIZER = tok
         _READY = True
         _LAST_ERROR = None
-        print(f"[startup] Model loaded: {model_id} on {DEVICE} (MPS={IS_MPS})", flush=True)
+        _HARDWARE_STATE.update(
+            {
+                "cpu_capability": cpu_cap,
+                "cpu_bf16": cpu_bf16,
+                "vram_gb": vram_gb,
+                "quantization_mode": MODEL_QUANTIZATION,
+                "active_precision": _ACTIVE_PRECISION,
+            }
+        )
+        msg = f"[startup] Model loaded: {model_id} (precision={_ACTIVE_PRECISION}, device={DEVICE}, MPS={IS_MPS})"
+        if vram_gb is not None:
+            msg += f" [VRAM: {vram_gb} GB]"
+        msg += f" [CPU: {cpu_cap}, bf16={cpu_bf16}]"
+        print(msg, flush=True)
     except Exception as e:
         _READY = False
         _LAST_ERROR = str(e)
@@ -233,7 +367,10 @@ def health():
         "ready": _READY,
         "last_error": _LAST_ERROR,
         "device": str(DEVICE),
-        "mps": IS_MPS
+        "mps": IS_MPS,
+        "quantization": MODEL_QUANTIZATION,
+        "precision": _ACTIVE_PRECISION,
+        "profile": _infer_profile(),
     }
 
 class ChatResponse(BaseModel):
