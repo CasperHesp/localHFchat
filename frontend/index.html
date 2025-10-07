@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Local HF Chat</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link href="/static/style.css" rel="stylesheet" />
+  </head>
+  <body>
+    <!-- Model loading overlay (auto-hides when /api/health.ready) -->
+    <div id="loadingScreen" class="loading hidden">
+      <div class="spinner"></div>
+      <div class="loading-text">Loading model… this can take a minute on first run.</div>
+    </div>
+
+    <div id="app">
+      <aside class="sidebar">
+        <div class="brand">Local HF Chat</div>
+        <button id="newChatBtn" class="primary">New conversation</button>
+
+        <div class="controls">
+          <label>
+            System prompt
+            <textarea id="sysPrompt" rows="4" placeholder="Default instructions"></textarea>
+          </label>
+
+          <label>
+            Extra context
+            <select id="contextKey">
+              <option value="market" selected>Market</option>
+              <option value="geography">Geography</option>
+              <option value="matching">Matching</option>
+            </select>
+          </label>
+
+          <label class="row">
+            Use session memory
+            <input id="useMemory" type="checkbox"/>
+          </label>
+
+          <div class="row">
+            <button id="summarizeBtn" title="Summarize and save to session memory">Summarize &amp; Save</button>
+            <button id="downloadMemoryBtn" title="Download session_memory.txt">Download</button>
+          </div>
+        </div>
+
+        <div class="conv-header">
+          Conversations
+          <button id="exportBtn" title="Export all">↧</button>
+        </div>
+        <ul id="conversations"></ul>
+
+        <div class="footer">
+          <label class="switch">
+            <input type="checkbox" id="themeToggle">
+            <span class="slider"></span>
+          </label>
+          <span>Dark mode</span>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div id="chat" class="chat"></div>
+
+        <!-- Typing indicator -->
+        <div id="typing" class="typing-bubble hidden">
+          <div class="spinner small"></div>
+          <div>Thinking…</div>
+        </div>
+
+        <form id="composer" class="composer">
+          <textarea id="input" rows="2" placeholder="Type a message..."></textarea>
+          <div class="row">
+            <button type="button" id="stopBtn">Stop</button>
+            <button id="sendBtn" class="primary">Send</button>
+          </div>
+        </form>
+      </main>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

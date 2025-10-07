@@ -1,0 +1,23 @@
+{
+  "company_market": [
+    "Shall we run a quick pulse on launch timing—what day actually drives the most first-week viewings and offers in your market?",
+    "How about asking buyers which price bands feel “right now” in your area—does €350k or €450k attract more real bids?",
+    "Let’s check whether complete documentation changes intent to bid—do buyers feel ready sooner when everything’s in the file?",
+    "What if we test whether a clear €8k–€18k energy-upgrade budget boosts willingness to view?",
+    "Shall we benchmark over-ask expectations this quarter—how many buyers plan to bid above asking?"
+  ],
+  "company_geography": [
+    "Let’s ask how many public-transport minutes to the main station buyers consider acceptable in each buurt.",
+    "How about a quick check on what “well connected” means locally—how many peak departures per hour feel sufficient?",
+    "Shall we see how noise bands (≤55 dB vs >60 dB) shift floor-level preference near busy roads?",
+    "Let’s measure how much park or water within 800 m moves the needle for families.",
+    "How about surveying which two-city corridors buyers treat as one search area (e.g., Leiden–Delft, The Hague–Delft)?"
+  ],
+  "company_matching": [
+    "Shall we ask first-time buyers which commute band they actually prefer—15–30 or 30–45 PT minutes?",
+    "Let’s check how upsizers trade commute minutes for extra living space in your listings.",
+    "How about a pulse with investors on multimodal zones near campuses or major employers—still top of the list?",
+    "Shall we test willingness to pay for label A/B versus label C if there’s a priced upgrade path?",
+    "Let’s learn which viewing slots different buyer types prefer—Thursday evening or Saturday morning."
+  ]
+}

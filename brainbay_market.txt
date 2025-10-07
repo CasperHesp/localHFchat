@@ -1,0 +1,44 @@
+Brainbay Market Letter — Netherlands Q3 2025
+
+Period and scope
+Coverage: Netherlands through 2025-Q3, with municipality, district, and neighbourhood texture where patterns are consistent. Metrics are aggregated, descriptive, and aligned to the CBS geography (gemeente → wijk → buurt).
+
+Executive summary
+National median sale price held broadly steady at €445,000–€455,000 in Q3, up 0.2%–0.6% quarter-on-quarter and 3%–5% year-on-year. Days on market improved to 26–31 days from 28–34 in Q2. New listings reached 40,000–44,000 versus 37,000–41,000 accepted offers, lifting active stock to 68,000–74,000 by quarter-end. Months of supply stood at 1.8–2.2 nationally, 1.2–1.6 in core urban buurten, and 2.4–3.0 in outer belts. The list-to-sale ratio averaged 100.8%–102.2%, with 50%–56% of sales at or above asking.
+
+Prices and valuation
+The national median sale price printed €445k–€455k; mix effects were visible in neighbourhoods with higher shares of renovated A–B label stock. On a per-m² basis, inner cores ranged widely: Amsterdam €5,700–€6,100 per m²; Utrecht €4,900–€5,400; The Hague €4,300–€4,700; Rotterdam €3,800–€4,200. City-level medians clustered at Amsterdam €565k–€585k, Utrecht €510k–€530k, The Hague €435k–€455k, Rotterdam €395k–€415k. Negotiation bands narrowed: list-to-sale 101%–104% in tight inner-city buurten and 98%–100% in selected outer belts. Over-asking shares exceeded 60% in the most supply-constrained neighbourhoods and fell to 35%–42% where stock broadened.
+
+Tempo and conversion
+National days on market landed at 26–31. First credible offers typically arrived on day 9–12 for correctly priced listings with complete files and high-quality assets; 58%–64% of accepted offers occurred within the first 21 days. Viewings-to-offer conversion rates averaged 12%–16% in commuter belts and 8%–12% in peripheral markets. Scheduled price reviews at day 21–28 produced effective adjustments of 1.5%–2.5% when early engagement under-performed local benchmarks; a second review at day 42–49 was less frequently required and averaged 1.0%–2.0%.
+
+Supply, demand, and absorption
+New listings: 40k–44k in Q3. Accepted offers: 37k–41k. Quarter-end active stock: 68k–74k. Months of supply: 1.8–2.2 nationally; 1.2–1.6 in prime transit-served cores; 2.4–3.0 in outer belts with new-build pipeline deliveries. Quarterly absorption (accepted offers ÷ average active stock) ran at 0.48–0.56, highest for family-sized dwellings with flexible floor plans and lowest for poorly located compact units without amenities within walking distance.
+
+Energy performance and sustainability
+A–B labels shortened marketing periods by 12–18 days relative to C–D in the same buurt and dwelling type. Price outcomes reflected a 2.0%–3.5% uplift for A–B versus C–D, holding other factors equal. E–G labels faced 15–25 additional days on market and 1.5%–3.5% wider concessions unless paired with a clear, costed upgrade path. The share of accepted offers on A–C stock rose to 58%–64% of quarterly transactions in urban cores, reflecting buyer preferences for lower running costs and ready compliance with evolving standards.
+
+New-build and existing stock
+New-build deliveries totaled an estimated 9,000–11,000 dwellings in the quarter, accounting for 13%–16% of accepted offers. New-build pricing carried a 5%–9% premium to local resale, with days on market at 22–28 for inventory-ready units and longer tails where delivery timing or specifications were unclear. Existing-home listings emphasized move-in readiness; vendor-provided documentation packs (18–24 photos, up-to-date floor area, energy label, and maintenance notes) improved first-week engagement by 10%–18% versus underspecified peers.
+
+Geographical texture
+Core urban rail corridors sustained the fastest tempo: Amsterdam/Utrecht inner belts at 19–27 days on market and list-to-sale of 101%–104%. The Hague and Rotterdam varied by neighbourhood, with 22–30 days on market where amenities and transit access were strongest and 30–38 where they were weaker. Inner-belt suburbs posted months of supply at 1.5–2.0 and over-asking shares at 52%–60%. Peripheral and seasonal municipalities showed 33–42 days on market and list-to-sale at 98%–101%, with sharper weekend-seasonality patterns.
+
+Financing and policy timing
+Bid clusters concentrated around widely used lending thresholds; the €435,000–€450,000 band captured 18%–22% of accepted offers nationally, and the €350,000–€365,000 band a further 10%–13%. Acceptance probabilities were most sensitive within ±2% of these bands in neighbourhoods with abundant comparable stock. Around the year-turn, listing and notary scheduling tended to align with policy updates; go-live density in late January–February historically outperformed late December by 8%–12% in attention metrics.
+
+What brokers can do now
+Launch readiness: target a median time-to-first-touch of 30–60 minutes on new inquiries; listings launched with complete, audit-ready files secured first-week offer rates of 7%–10% versus 4%–6% for incomplete files.
+Price discipline: anchor to accepted-offer clusters within the same buurt and dwelling type; if engagement lags local medians by >25% in week one, plan a 1.5%–2.5% review at day 21–28.
+Timing and cadence: Tuesday–Thursday go-live windows and Saturday viewing blocks generated 8%–14% higher viewing-to-offer conversion in commuter belts than Sunday launches.
+Energy narrative: for C–D stock, attach a concise €8,000–€18,000 upgrade pathway (insulation + heating) to reduce days on market by 6–10; for A–B stock, highlight comfort and resilience to running-cost shifts.
+Micro-market lens: prioritize buurt-level absorption and months of supply; where MoS is ≤1.6, expect over-asking shares >55% and plan escalation strategies accordingly.
+
+Data quality and lags
+Listing events reflect near-real-time exchange flows; accepted offers firm up as notarial and registry events clear. Series are aligned to the current CBS municipal configuration for the reference year to avoid artefacts around mergers. Small-cell suppression is applied to protect privacy in thin markets.
+
+Method notes and definitions
+Median price is the central value among transacted dwellings within the period. Days on market counts calendar days from go-live to agreement on a sale contract. Absorption compares accepted offers with active inventory over the same window. Months of supply approximates time to clear current active listings at the recent pace of accepted offers. List-to-sale ratio compares achieved price with the original list price. Geography references municipality, district, and neighbourhood per CBS standards; mapping and analysis use Amersfoort / RD New (EPSG:28992).
+
+Closing view
+Q3 2025 favored well-prepared launches and realistic pricing. For Q4 execution, concentrate inventory where months of supply is 1.3–1.7, aim for first credible offers by day 10–12, and build seller confidence with evidence of offer clusters near the €435k–€450k and €350k–€365k bands.
