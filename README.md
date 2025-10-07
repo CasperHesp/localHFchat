@@ -1,11 +1,9 @@
-# Brainbay Local HF Chat — Quick Start
+# Brainbay Local HF Chat — Short Manual
 
-## Docker (recommended)
-
-> macOS (+GPU acceleration) is at the bottom.
+## Build, start & run (Docker, recommended)
 
 ```bash
-# Build & start (publishes a RANDOM host port for 8000 in the container)
+# Build & start (publishes a RANDOM host port for container port 8000)
 docker compose up --build -d
 
 # Find the URL to open
@@ -13,33 +11,77 @@ docker compose port chatapp 8000
 # -> http://localhost:XXXXX
 ```
 
----
-
 ## What it is
 
-A **fully local** chat app: **FastAPI** backend + minimalist **vanilla** frontend, powered by a **public Hugging Face** chat model.
-
-* **Brainbay-aware** assistant: system prompt + `brainbay_company.txt`, plus one extra context via dropdown (**Market/Geography/Matching** from `brainbay_*.txt`).
-* **Frontend**: Markdown, “Thinking…” spinner, **Stop** button, loading overlay (auto-reload when model is ready), intro markdown per context, **10s kickstart** prompts, conversation list (rename/delete), export/import, dark mode, **session memory** (summarize & save, downloadable).
-* **Backend**: Hugging Face Transformers (no external inference API), tuned decoding (temp 0.3 / top_p 0.95 / top_k 40 / rep 1.05), **auto token budgeting**, **timeout guard** (default 12s) to prevent stalls, endpoints for chat/summarize/memory.
-* **macOS Apple Silicon**: MPS (GPU) acceleration supported (see below).
+A **fully local** chat app: **FastAPI** backend + minimalist **vanilla** frontend, powered by a **public Hugging Face** chat model. It’s Brainbay-aware via simple text files, supports small models, and includes UX niceties (Markdown, spinner, Stop, intro/kickstart prompts, session memory). Designed to run in Docker or natively on macOS (Apple Silicon with MPS).
 
 ---
 
-## macOS (+GPU/MPS) option
+## Project structure — and why each file exists
 
-If you prefer running locally without Docker and want Apple GPU acceleration:
+```
+project-root/
+  backend/app/main.py
+  frontend/
+    index.html
+    style.css
+    app.js
+    conversation_starters.json
+    intro_markdown.json
+  brainbay_company.txt
+  brainbay_market.txt
+  brainbay_geography.txt
+  brainbay_matching.txt
+  session_memory.txt
+  Dockerfile
+  docker-compose.yml
+  run_macos.sh
+  requirements*.txt
+```
+
+* **backend/app/main.py** — FastAPI app. Loads a small HF chat model; merges context **as data** (system → company → selected dropdown file → optional session memory); adds guardrails (timeout, no-repeat, tuned sampling); serves `/static` + UI.
+* **frontend/index.html / style.css / app.js** — Small custom UI: Markdown render, “Thinking…” spinner, **Stop**, intro markdown (per context), **10s kickstart** prompts, export/import history, dark mode, session memory (summarize & save + download).
+* **conversation_starters.json** — Content-only list of kickstart prompts per context (edit without touching code).
+* **intro_markdown.json** — One intro block per context, shown once at chat start.
+* **brainbay_*.txt** — **Demo** context files (company / market / geography / matching). Swappable via env vars.
+* **session_memory.txt** — Optional running memory appended by the “Summarize & Save” feature (can be included as context via toggle).
+* **Dockerfile / docker-compose.yml** — Containerized run; compose publishes a **random host port** to avoid collisions.
+* **run_macos.sh / requirements*.txt** — macOS convenience: install from requirements, pick a random free port, enable MPS, open browser.
+
+### About the data in `brainbay_*.txt`
+
+* The contents were **scraped and inferred from public data using other AI tools** and are meant as **placeholders for internal Brainbay context for demo purposes**.
+* They are **not actual sensitive plaintext** in this demo. In future production passes, they can be replaced with more sensitive data, in which case we could (optionally) add **encryption layers** (e.g., client-side + at-rest). Until then, treat these as placeholders showing the intended workflow.
+
+---
+
+## Technologies used
+
+* **Backend:** FastAPI + Uvicorn, Hugging Face **Transformers**, **PyTorch** (+ Apple **MPS** on macOS), Accelerate
+* **Frontend:** custom vanilla **HTML/CSS/JS** (no UI framework)
+* **Container:** Docker, docker-compose
+
+---
+
+## Creative choices
+
+* **Context as data** — Behavior steered by editable text/JSON files; no rebuilds to change domain knowledge.
+* **Small-model ergonomics** — Tuned decoding (`temperature=0.3`, `top_p=0.95`, `top_k=40`, `repetition_penalty=1.05`), **auto token budgeting**, `no_repeat_ngram_size=3`, **timeout guard** (default 12s) to reduce stalls/loops.
+* **Helpful UX** — Markdown, spinner, **Stop**, intro per context, **10s kickstart**, export/import, dark mode, session memory with summarization.
+
+---
+
+## macOS option (+GPU/MPS)
 
 ```bash
-# optional: choose a tiny public HF model
+# (optional) choose a small public HF model
 export MODEL_ID="Qwen/Qwen2.5-0.5B-Instruct"
 
-# use your requirements.txt (or requirements-macos.txt) for install
 python3 -m venv .venv && source .venv/bin/activate
 python -m pip install --upgrade pip wheel
-pip install -r requirements.txt  # or: pip install -r requirements-macos.txt
+pip install -r requirements.txt   # or: requirements-macos.txt
 
-# pick a free port and launch
+# run on a free port
 PORT=$(python - <<'PY'
 import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()
 PY
@@ -48,10 +90,3 @@ export PYTORCH_ENABLE_MPS_FALLBACK=1
 uvicorn backend.app.main:app --host 0.0.0.0 --port "$PORT"
 # open http://localhost:$PORT
 ```
-
-> Tip: use the included `run_macos.sh` to auto-install from requirements, pick a random free port, enable MPS, and open your browser:
->
-> ```bash
-> chmod +x run_macos.sh
-> MODEL_ID="HuggingFaceTB/SmolLM2-360M-Instruct" ./run_macos.sh
-> ```
