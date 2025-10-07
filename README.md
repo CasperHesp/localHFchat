@@ -40,7 +40,7 @@ project-root/
 ```
 
 * **backend/app/main.py** — FastAPI app. Loads a small HF chat model; merges context **as data** (system → company → selected dropdown file → optional session memory); adds guardrails (timeout, no-repeat, tuned sampling); serves `/static` + UI.
-* **frontend/index.html / style.css / app.js** — Small custom UI: Markdown render, “Thinking…” spinner, **Stop**, intro markdown (per context), **10s kickstart** prompts, export/import history, dark mode, session memory (summarize & save + download).
+* **frontend/index.html / style.css / app.js** — Small custom UI: Markdown render, “Thinking…” spinner, **Stop**, intro markdown (per context), **10s kickstart** prompts, export/import history, dark mode, session memory (summarize & save + download), plus a live status bar with hardware/model insights and a fast/balanced/quality mode switcher.
 * **conversation_starters.json** — Content-only list of kickstart prompts per context (edit without touching code).
 * **intro_markdown.json** — One intro block per context, shown once at chat start.
 * **brainbay_*.txt** — **Demo** context files (company / market / geography / matching). Swappable via env vars.
@@ -68,6 +68,7 @@ project-root/
 * **[EDGE:contextually compressed data]**: Behavior steered by editable text/JSON files; no rebuilds to change domain knowledge. Sensitive data can be safely and bijectively pseudonymised elsewhere (i.e.,ensuring security & recoverability).
 * **[CORE: on-device ergonomics]:** Tuned decoding (`temperature=0.3`, `top_p=0.95`, `top_k=40`, `repetition_penalty=1.05`), **auto token budgeting**, `no_repeat_ngram_size=3`, **timeout guard** (default 12s) to reduce stalls/loops.
 * **[SENSE: responsive UI/UX]**: Markdown, spinner, **Stop**, intro per context, **10s kickstart**, export/import, dark mode, session memory with summarization.
+* **[FLOW: adaptive scaling]**: Backend inspects the runtime (CPU vs GPU/MPS) and model size to auto-tune dtype, token/time budgets and three preset “Fast / Balanced / Quality” modes surfaced in the UI via a live status bar (model/device/budget).
 
 ---
 
