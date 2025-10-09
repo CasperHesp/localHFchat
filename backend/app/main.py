@@ -307,6 +307,8 @@ class CancelCriteria(StoppingCriteria):
 
 # ====== Model ======
 _MODEL_LOCK = threading.Lock()
+_WARM_LOCK = threading.Lock()
+_WARM_THREAD: Optional[threading.Thread] = None
 _PIPE = None
 _TOKENIZER = None
 _READY = False
@@ -389,6 +391,32 @@ def _infer_profile() -> Dict[str, Optional[float]]:
         "vram_gb": _HARDWARE_STATE.get("vram_gb"),
     }
     return profile
+
+def _launch_background_warmup():
+    """Ensure a background thread is attempting to load the model."""
+
+    global _WARM_THREAD
+
+    if _READY:
+        return
+
+    with _WARM_LOCK:
+        if _READY:
+            return
+        if _WARM_THREAD is not None and _WARM_THREAD.is_alive():
+            return
+
+        def _runner():
+            try:
+                ensure_ready()
+            except Exception:
+                # Errors are captured by ensure_ready/_load_pipeline which
+                # populate _LAST_ERROR for the health endpoint.
+                pass
+
+        _WARM_THREAD = threading.Thread(target=_runner, daemon=True)
+        _WARM_THREAD.start()
+
 
 def _load_pipeline(model_id: str):
     global _PIPE, _TOKENIZER, _READY, _LAST_ERROR, MODEL_CTX_LIMIT, MAX_NEW_CAP, OPTIMIZATION_INFO
@@ -636,6 +664,8 @@ def _auto_max_new_tokens(prompt: str) -> int:
 # ====== API ======
 @app.get("/api/health")
 def health():
+    if not _READY:
+        _launch_background_warmup()
     profile = dict(PROFILE_INFO)
     defaults = dict(profile.get("defaults", {}))
     profile_modes = {}
@@ -915,7 +945,7 @@ def memory_read():
 
 @app.on_event("startup")
 def _warm():
-    threading.Thread(target=lambda: ensure_ready(), daemon=True).start()
+    _launch_background_warmup()
 
 # Static & root
 if STATIC_DIR.exists():
