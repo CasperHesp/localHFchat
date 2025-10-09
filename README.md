@@ -51,7 +51,7 @@ project-root/
 ### About the data in `brainbay_*.txt`
 
 * The contents were **scraped and inferred from public data using other AI tools** and are meant as **placeholders for internal Brainbay context for demo purposes**.
-* They are **not actual sensitive plaintext** in this demo. In future production passes, they can be replaced with more sensitive data, in which case we could (optionally) add **encryption layers** (e.g., client-side + at-rest). Until then, treat these as placeholders showing the intended workflow.
+* They is **no actual sensitive plaintext** in this demo. In future production passes, they can be replaced with more sensitive data, in which case we could (optionally) add **encryption layers** (e.g., client-side + at-rest). Until then, treat these as placeholders showing the intended workflow.
 
 ---
 
