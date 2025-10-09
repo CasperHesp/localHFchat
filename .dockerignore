@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.venv/
+venv/
+.env
+.env.local
+
+# Node / frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# OS / tooling
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Git
+.git/
+.gitignore
+
+# Build outputs
+build/
+dist/
+*.egg-info/
+
+# Hugging Face cache
+.cache/
+
+# Docker
+Dockerfile.*~

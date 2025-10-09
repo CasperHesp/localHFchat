@@ -6,13 +6,22 @@
 # Build & start (publishes a RANDOM host port for container port 8000)
 docker compose up --build -d
 
-# Find the URL to open
+# Find the URL to open (prints something like http://localhost:XXXXX)
 docker compose port chatapp 8000
-# -> http://localhost:XXXXX
 
 # (optional) force precision: auto (default), full, or 4bit quantized
 MODEL_QUANTIZATION=4bit docker compose up --build -d
+
+# (optional) pin a host port instead of a random one
+HOST_PORT=5173 docker compose up --build -d
 ```
+
+### Helper scripts
+
+* **macOS / Linux** – `./run_docker.sh` automatically builds, starts, opens the browser (using `open`, `xdg-open`, or `powershell.exe` on WSL), and tails logs.
+* **Windows PowerShell** – `pwsh ./scripts/run-windows.ps1` (or `powershell` on Windows). It mirrors the shell script behaviour and works out-of-the-box with Docker Desktop.
+
+> Tip: copy `.env.example` to `.env` to customise defaults (`MODEL_ID`, `HOST_PORT`, etc.) without editing the compose file.
 
 ## What it is
 
@@ -31,6 +40,7 @@ project-root/
     app.js
     conversation_starters.json
     intro_markdown.json
+  backend/requirements/base.txt
   brainbay_company.txt
   brainbay_market.txt
   brainbay_geography.txt
@@ -38,12 +48,16 @@ project-root/
   session_memory.txt
   Dockerfile
   docker-compose.yml
+  infra/docker/entrypoint.sh
   run_macos.sh
+  run_docker.sh
+  scripts/run-windows.ps1
   requirements.txt
 ```
 
 * **backend/app/main.py** — FastAPI app. Loads a small HF chat model; merges context **as data** (system → company → selected dropdown file → optional session memory); adds guardrails (timeout, no-repeat, tuned sampling); serves `/static` + UI.
 * **frontend/index.html / style.css / app.js** — Small custom UI: Markdown render, “Thinking…” spinner, **Stop**, intro markdown (per context), **10s kickstart** prompts, export/import history, dark mode, session memory (summarize & save + download), plus a live status bar with hardware/model insights and a fast/balanced/quality mode switcher.
+* **backend/requirements/base.txt** — Canonical Python dependency list shared by the Docker image and local scripts.
 * **conversation_starters.json** — Content-only list of kickstart prompts per context (edit without touching code).
 * **intro_markdown.json** — One intro block per context, shown once at chat start.
 * **brainbay_*.txt** — **Demo** context files (company / market / geography / matching). Swappable via env vars.

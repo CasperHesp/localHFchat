@@ -1,21 +1,51 @@
-FROM python:3.11-slim
+# syntax=docker/dockerfile:1.7
+FROM python:3.11-slim AS runtime
 
-RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-WORKDIR /app
+ARG APP_HOME=/app
+WORKDIR ${APP_HOME}
 
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential git \
+    && rm -rf /var/lib/apt/lists/*
 
-COPY backend/app /app/app
-COPY frontend /app/frontend
-COPY brainbay_company.txt /app/brainbay_company.txt
-COPY brainbay_market.txt /app/brainbay_market.txt
-COPY brainbay_geography.txt /app/brainbay_geography.txt
-COPY brainbay_matching.txt /app/brainbay_matching.txt
+COPY requirements.txt ./requirements.txt
+COPY backend/requirements ./backend/requirements
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --upgrade pip \
+    && pip install --no-cache-dir -r ./requirements.txt
 
-ENV TRANSFORMERS_CACHE=/app/.cache/huggingface HF_HOME=/app/.cache/huggingface HF_HUB_DISABLE_TELEMETRY=1 PORT=8000 COMPANY_INFO_PATH=/app/brainbay_company.txt BRAINBAY_MARKET_PATH=/app/brainbay_market.txt BRAINBAY_GEOGRAPHY_PATH=/app/brainbay_geography.txt BRAINBAY_MATCHING_PATH=/app/brainbay_matching.txt MODEL_QUANTIZATION=auto
+COPY backend/app ${APP_HOME}/app
+COPY frontend ${APP_HOME}/frontend
+COPY brainbay_company.txt ${APP_HOME}/brainbay_company.txt
+COPY brainbay_market.txt ${APP_HOME}/brainbay_market.txt
+COPY brainbay_geography.txt ${APP_HOME}/brainbay_geography.txt
+COPY brainbay_matching.txt ${APP_HOME}/brainbay_matching.txt
+COPY infra/docker/entrypoint.sh /usr/local/bin/entrypoint
+
+RUN chmod +x /usr/local/bin/entrypoint \
+    && groupadd --system --gid 1001 appuser \
+    && useradd --system --uid 1001 --gid appuser --create-home appuser \
+    && mkdir -p ${APP_HOME}/.cache/huggingface \
+    && chown -R appuser:appuser ${APP_HOME}
+
+USER appuser
+
+ENV TRANSFORMERS_CACHE=${APP_HOME}/.cache/huggingface \
+    HF_HOME=${APP_HOME}/.cache/huggingface \
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    COMPANY_INFO_PATH=${APP_HOME}/brainbay_company.txt \
+    BRAINBAY_MARKET_PATH=${APP_HOME}/brainbay_market.txt \
+    BRAINBAY_GEOGRAPHY_PATH=${APP_HOME}/brainbay_geography.txt \
+    BRAINBAY_MATCHING_PATH=${APP_HOME}/brainbay_matching.txt \
+    MODEL_QUANTIZATION=auto \
+    PORT=8000 \
+    APP_MODULE=app.main:app \
+    APP_HOST=0.0.0.0
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+ENTRYPOINT ["entrypoint"]
+CMD []
