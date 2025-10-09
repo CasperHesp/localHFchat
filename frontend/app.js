@@ -275,10 +275,14 @@ async function sendMessage(text) {
   conv.messages.push({ role: 'user', content: text }); save(); renderChat();
   el('#sendBtn').disabled = true; el('#sendBtn').textContent = '...'; showTyping();
 
+  let assistantMsg = null;
+  let reader = null;
+  let finalMeta = null;
+  let streamError = null;
+
   try {
     let ctx = conv.messages.slice(-12);
 
-    // Build system prompt (+session memory if enabled)
     const sysParts = [state.settings.system_prompt];
     if (state.settings.use_memory && state.sessionMemory.trim()) {
       sysParts.push("\n\n[Session memory]\n" + state.sessionMemory.trim());
@@ -317,6 +321,25 @@ async function sendMessage(text) {
     if (payload.max_time_s == null) delete payload.max_time_s;
     payload.no_repeat_ngram_size = Math.max(1, Math.round(payload.no_repeat_ngram_size || 3));
 
+    assistantMsg = { role: 'assistant', content: '' };
+    conv.messages.push(assistantMsg);
+    save();
+    renderChat();
+
+    const chatEl = el('#chat');
+    const getAssistantContentEl = () => {
+      const nodes = chatEl.querySelectorAll('.msg.assistant .content');
+      return nodes.length ? nodes[nodes.length - 1] : null;
+    };
+    let assistantContentEl = getAssistantContentEl();
+    const applyAssistantContent = () => {
+      if (!assistantContentEl) assistantContentEl = getAssistantContentEl();
+      if (assistantContentEl) {
+        assistantContentEl.innerHTML = mdToHtml(assistantMsg.content);
+        chatEl.scrollTop = chatEl.scrollHeight;
+      }
+    };
+
     currentAbort = new AbortController();
     const res = await fetch('/api/chat', {
       method: 'POST',
@@ -328,22 +351,112 @@ async function sendMessage(text) {
       const err = await res.json().catch(() => ({}));
       throw new Error(err.detail || res.statusText);
     }
-    const data = await res.json();
-    if (data.mode && state.settings.performance_mode !== data.mode) {
-      state.settings.performance_mode = data.mode;
-      save();
-      updateStatusUI();
+    if (!res.body) {
+      throw new Error('Streaming not supported in this browser.');
     }
-    conv.messages.push({ role: 'assistant', content: data.content });
+
+    reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    const handlePayload = (payload) => {
+      if (!payload || typeof payload !== 'object') return;
+      if (payload.type === 'token' && typeof payload.token === 'string') {
+        assistantMsg.content += payload.token;
+        applyAssistantContent();
+      } else if (payload.type === 'end') {
+        if (typeof payload.content === 'string') {
+          assistantMsg.content = payload.content;
+        }
+        finalMeta = payload;
+        if (payload.mode && state.settings.performance_mode !== payload.mode) {
+          state.settings.performance_mode = payload.mode;
+          save();
+          updateStatusUI();
+        }
+        applyAssistantContent();
+      } else if (payload.type === 'error') {
+        throw new Error(payload.error || 'Generation failed.');
+      }
+    };
+
+    const processBuffer = () => {
+      while (true) {
+        const idx = buffer.indexOf('\n');
+        if (idx < 0) break;
+        const raw = buffer.slice(0, idx).replace(/\r$/, '');
+        buffer = buffer.slice(idx + 1);
+        if (!raw) continue;
+        let payload;
+        try {
+          payload = JSON.parse(raw);
+        } catch (_) {
+          continue;
+        }
+        try {
+          handlePayload(payload);
+        } catch (err) {
+          streamError = err;
+          return;
+        }
+        if (finalMeta) return;
+      }
+    };
+
+    while (!finalMeta && !streamError) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      processBuffer();
+    }
+
+    if (!streamError) {
+      buffer += decoder.decode();
+      processBuffer();
+    }
+
+    if (streamError) throw streamError;
+    if (!finalMeta) throw new Error('Generation ended unexpectedly.');
+
+    if (finalMeta.stop_reason === 'timeout') {
+      assistantMsg.content = assistantMsg.content.trimEnd() + '\n\n_[stopped early: timeout]_';
+    } else if (finalMeta.stop_reason === 'cancelled') {
+      assistantMsg.content = assistantMsg.content.trimEnd() + '\n\n_[generation cancelled]_';
+    }
+    applyAssistantContent();
+
     if (!conv.title || conv.title === 'New chat') conv.title = (text.length > 30 ? text.slice(0, 30) + '…' : text);
-    save(); renderChat();
+    save();
+    renderChat();
   } catch (e) {
     if (e.name === 'AbortError') {
-      const conv = currentConv(); if (conv) { conv.messages.push({ role: 'assistant', content: '_[stopped by user]_' }); save(); renderChat(); }
+      if (assistantMsg) {
+        assistantMsg.content = assistantMsg.content.trimEnd();
+        if (assistantMsg.content) {
+          assistantMsg.content += '\n\n_[stopped by user]_';
+        } else {
+          conv.messages.pop();
+          conv.messages.push({ role: 'assistant', content: '_[stopped by user]_' });
+        }
+        save();
+        renderChat();
+      } else {
+        conv.messages.push({ role: 'assistant', content: '_[stopped by user]_' });
+        save();
+        renderChat();
+      }
     } else {
+      if (assistantMsg) {
+        conv.messages = conv.messages.filter(m => m !== assistantMsg);
+      }
+      save();
+      renderChat();
       alert('Error: ' + e.message);
     }
   } finally {
+    if (reader) {
+      try { await reader.cancel(); } catch (_) {}
+    }
     el('#sendBtn').disabled = false; el('#sendBtn').textContent = 'Send'; hideTyping(); currentAbort = null; resetIdleTimer();
   }
 }
