@@ -17,7 +17,12 @@ except ImportError:  # pragma: no cover - optional dependency at runtime
     BitsAndBytesConfig = None
 
 # ====== Speed & device setup ======
-MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen2.5-0.5B-Instruct")
+PRIMARY_MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen2.5-0.5B-Instruct")
+FALLBACK_MODEL_ID = os.environ.get("FALLBACK_MODEL_ID", "sshleifer/tiny-gpt2").strip()
+if FALLBACK_MODEL_ID and FALLBACK_MODEL_ID.lower() in {"none", ""}:
+    FALLBACK_MODEL_ID = ""
+FALLBACK_MIN_MODEL_RAM_GB = float(os.environ.get("FALLBACK_MIN_MODEL_RAM_GB", "0.5"))
+MODEL_ID = PRIMARY_MODEL_ID
 MODEL_QUANTIZATION = os.environ.get("MODEL_QUANTIZATION", "auto").strip().lower()
 if MODEL_QUANTIZATION not in {"auto", "full", "4bit"}:
     MODEL_QUANTIZATION = "auto"
@@ -145,26 +150,42 @@ def _infer_profile(model_id: str) -> Dict[str, Any]:
     return profile
 
 
-PROFILE_INFO = _infer_profile(MODEL_ID)
-PROFILE_DEFAULTS = PROFILE_INFO.get("defaults", {})
+def _recompute_generation_defaults(model_id: str) -> None:
+    global PROFILE_INFO, PROFILE_DEFAULTS, DEFAULT_TEMPERATURE, DEFAULT_TOP_P
+    global DEFAULT_REPETITION_PENALTY, DEFAULT_NO_REPEAT_NGRAM, DEFAULT_TOP_K
+    global DEFAULT_MAX_NEW_TOKENS, MAX_NEW_CAP, DEFAULT_MODE, DEFAULT_MAX_TIME_S
+    global MODEL_CTX_LIMIT
 
-DEFAULT_TEMPERATURE = float(os.environ.get("GENERATION_TEMPERATURE", PROFILE_DEFAULTS.get("temperature", 0.3)))
-DEFAULT_TOP_P = float(os.environ.get("GENERATION_TOP_P", PROFILE_DEFAULTS.get("top_p", 0.95)))
-DEFAULT_REPETITION_PENALTY = float(
-    os.environ.get("GENERATION_REPETITION_PENALTY", PROFILE_DEFAULTS.get("repetition_penalty", 1.05))
-)
-DEFAULT_NO_REPEAT_NGRAM = int(
-    os.environ.get("GENERATION_NO_REPEAT_NGRAM", PROFILE_DEFAULTS.get("no_repeat_ngram_size", 3))
-)
-DEFAULT_TOP_K = int(os.environ.get("GENERATION_TOP_K", PROFILE_DEFAULTS.get("top_k", 40)))
-DEFAULT_MAX_NEW_TOKENS = int(
-    os.environ.get("GENERATION_MAX_NEW_TOKENS", PROFILE_DEFAULTS.get("max_new_tokens", 512))
-)
-MAX_NEW_CAP = int(PROFILE_DEFAULTS.get("max_new_cap", max(DEFAULT_MAX_NEW_TOKENS, 512)))
-DEFAULT_MODE = PROFILE_DEFAULTS.get("default_mode", "balanced")
-DEFAULT_MAX_TIME_S = float(
-    os.environ.get("GENERATION_MAX_TIME_S", PROFILE_DEFAULTS.get("max_time_s", 200.0))
-)
+    PROFILE_INFO = _infer_profile(model_id)
+    PROFILE_DEFAULTS = PROFILE_INFO.get("defaults", {})
+
+    DEFAULT_TEMPERATURE = float(
+        os.environ.get("GENERATION_TEMPERATURE", PROFILE_DEFAULTS.get("temperature", 0.3))
+    )
+    DEFAULT_TOP_P = float(os.environ.get("GENERATION_TOP_P", PROFILE_DEFAULTS.get("top_p", 0.95)))
+    DEFAULT_REPETITION_PENALTY = float(
+        os.environ.get(
+            "GENERATION_REPETITION_PENALTY", PROFILE_DEFAULTS.get("repetition_penalty", 1.05)
+        )
+    )
+    DEFAULT_NO_REPEAT_NGRAM = int(
+        os.environ.get(
+            "GENERATION_NO_REPEAT_NGRAM", PROFILE_DEFAULTS.get("no_repeat_ngram_size", 3)
+        )
+    )
+    DEFAULT_TOP_K = int(os.environ.get("GENERATION_TOP_K", PROFILE_DEFAULTS.get("top_k", 40)))
+    DEFAULT_MAX_NEW_TOKENS = int(
+        os.environ.get("GENERATION_MAX_NEW_TOKENS", PROFILE_DEFAULTS.get("max_new_tokens", 512))
+    )
+    MAX_NEW_CAP = int(PROFILE_DEFAULTS.get("max_new_cap", max(DEFAULT_MAX_NEW_TOKENS, 512)))
+    DEFAULT_MODE = PROFILE_DEFAULTS.get("default_mode", "balanced")
+    DEFAULT_MAX_TIME_S = float(
+        os.environ.get("GENERATION_MAX_TIME_S", PROFILE_DEFAULTS.get("max_time_s", 200.0))
+    )
+    MODEL_CTX_LIMIT = int(PROFILE_INFO.get("max_context_tokens", 2048))
+
+
+_recompute_generation_defaults(MODEL_ID)
 
 DEFAULT_SYS = (
     "You are a helpful brokerage assistant, proactively helping Brainbay and their affiliates. You are an optimist by\n"
@@ -181,8 +202,6 @@ PROFILE_INFO.update(
     }
 )
 PROFILE_INFO.setdefault("optimizations", dict(OPTIMIZATION_INFO))
-
-MODEL_CTX_LIMIT = int(PROFILE_INFO.get("max_context_tokens", 2048))
 
 # ====== App ======
 app = FastAPI(title="HF Local Chat API (timeouts patch)", version="0.2.0")
@@ -312,6 +331,8 @@ _TOKENIZER = None
 _READY = False
 _LAST_ERROR = None
 _ACTIVE_PRECISION = "full"
+_USING_FALLBACK_MODEL = False
+_FALLBACK_ACTIVATION_REASON: Optional[str] = None
 _HARDWARE_STATE: Dict[str, Optional[float]] = {
     "cpu_capability": None,
     "cpu_bf16": None,
@@ -319,6 +340,8 @@ _HARDWARE_STATE: Dict[str, Optional[float]] = {
     "quantization_mode": MODEL_QUANTIZATION,
     "active_precision": _ACTIVE_PRECISION,
 }
+
+MIN_MODEL_RAM_GB = float(os.environ.get("MIN_MODEL_RAM_GB", "3.0"))
 
 
 def _detect_cpu_capability() -> str:
@@ -342,6 +365,54 @@ def _detect_vram_gb() -> Optional[float]:
             return round(props.total_memory / (1024 ** 3), 2)
     except Exception:
         pass
+    return None
+
+
+def _read_cgroup_memory_limit_gb() -> Optional[float]:
+    try:
+        limit_path = pathlib.Path("/sys/fs/cgroup/memory.max")
+        if not limit_path.is_file():
+            return None
+        raw = limit_path.read_text(encoding="utf-8").strip()
+        if not raw or raw == "max":
+            return None
+        value = int(raw)
+        if value <= 0:
+            return None
+        # Guard for absurdly large sentinel values
+        if value >= 1 << 60:
+            return None
+        return round(value / (1024 ** 3), 2)
+    except Exception:
+        return None
+
+
+def _read_total_ram_gb() -> Optional[float]:
+    try:
+        meminfo = pathlib.Path("/proc/meminfo")
+        if not meminfo.is_file():
+            return None
+        for line in meminfo.read_text(encoding="utf-8").splitlines():
+            if line.lower().startswith("memtotal:"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    # Value is reported in kB
+                    kb = float(parts[1])
+                    return round(kb / (1024 ** 2), 2)
+    except Exception:
+        pass
+    return None
+
+
+def _memory_guard(min_required_gb: float) -> Optional[str]:
+    limit_gb = _read_cgroup_memory_limit_gb()
+    if limit_gb is not None and limit_gb < min_required_gb:
+        return f"memory limit {limit_gb}GB < required {min_required_gb}GB"
+
+    total_ram = _read_total_ram_gb()
+    if total_ram is not None and total_ram < min_required_gb:
+        return f"system RAM {total_ram}GB < required {min_required_gb}GB"
+
     return None
 
 
@@ -390,199 +461,310 @@ def _infer_profile() -> Dict[str, Optional[float]]:
     }
     return profile
 
-def _load_pipeline(model_id: str):
+def _load_model_candidate(model_id: str, cpu_cap: str, cpu_bf16: bool, vram_gb: Optional[float]) -> None:
     global _PIPE, _TOKENIZER, _READY, _LAST_ERROR, MODEL_CTX_LIMIT, MAX_NEW_CAP, OPTIMIZATION_INFO
-    try:
-        tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, use_fast=True)
+    global _ACTIVE_PRECISION
 
-        optimization = {
-            "device_type": DEVICE_TYPE,
+    _recompute_generation_defaults(model_id)
+
+    PROFILE_INFO.update(
+        {
+            "device": str(DEVICE),
             "dtype": str(DTYPE),
-            "quantization": "none",
-            "bettertransformer": False,
-            "compiled": False,
-            "matmul_precision": None,
-            "interop_threads": None,
+            "threads": _NUM_THREADS,
+            "mps": IS_MPS,
+            "cuda": IS_CUDA,
         }
+    )
 
-        if DEVICE_TYPE == "cpu":
-            matmul_precision = os.environ.get("TORCH_FLOAT32_MATMUL_PRECISION", "medium")
+
+    tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, use_fast=True)
+
+    optimization = {
+        "device_type": DEVICE_TYPE,
+        "dtype": str(DTYPE),
+        "quantization": "none",
+        "bettertransformer": False,
+        "compiled": False,
+        "matmul_precision": None,
+        "interop_threads": None,
+    }
+
+    if DEVICE_TYPE == "cpu":
+        matmul_precision = os.environ.get("TORCH_FLOAT32_MATMUL_PRECISION", "medium")
+        try:
+            torch.set_float32_matmul_precision(matmul_precision)
+            optimization["matmul_precision"] = matmul_precision
+        except Exception as err:
+            print(f"[startup] torch.set_float32_matmul_precision failed: {err}", flush=True)
+        interop_env = os.environ.get("NUM_INTEROP_THREADS")
+        try:
+            interop_threads = int(interop_env) if interop_env is not None else _NUM_THREADS
+        except ValueError:
+            print(
+                f"[startup] Invalid NUM_INTEROP_THREADS={interop_env!r}, using {_NUM_THREADS}",
+                flush=True,
+            )
+            interop_threads = _NUM_THREADS
+        if hasattr(torch, "set_num_interop_threads"):
             try:
-                torch.set_float32_matmul_precision(matmul_precision)
-                optimization["matmul_precision"] = matmul_precision
+                torch.set_num_interop_threads(max(1, interop_threads))
+                optimization["interop_threads"] = max(1, interop_threads)
             except Exception as err:
-                print(f"[startup] torch.set_float32_matmul_precision failed: {err}", flush=True)
-            interop_env = os.environ.get("NUM_INTEROP_THREADS")
-            try:
-                interop_threads = int(interop_env) if interop_env is not None else _NUM_THREADS
-            except ValueError:
-                print(
-                    f"[startup] Invalid NUM_INTEROP_THREADS={interop_env!r}, using {_NUM_THREADS}",
-                    flush=True,
-                )
-                interop_threads = _NUM_THREADS
-            if hasattr(torch, "set_num_interop_threads"):
-                try:
-                    torch.set_num_interop_threads(max(1, interop_threads))
-                    optimization["interop_threads"] = max(1, interop_threads)
-                except Exception as err:
-                    print(f"[startup] torch.set_num_interop_threads failed: {err}", flush=True)
+                print(f"[startup] torch.set_num_interop_threads failed: {err}", flush=True)
 
-        quantization_candidates: List[str] = []
-        if DEVICE_TYPE == "cuda" and BitsAndBytesConfig is not None and _env_flag("ENABLE_BNB_QUANTIZATION", "1"):
-            preferred = os.environ.get("QUANTIZATION_MODE", "4bit").strip().lower()
-            if preferred in {"4bit", "8bit"}:
-                quantization_candidates = [preferred, "8bit" if preferred == "4bit" else "4bit"]
+    quantization_candidates: List[str] = []
+    should_quantize = _should_quantize(cpu_cap, cpu_bf16, vram_gb)
+    if (
+        should_quantize
+        and DEVICE_TYPE == "cuda"
+        and BitsAndBytesConfig is not None
+        and _env_flag("ENABLE_BNB_QUANTIZATION", "1")
+    ):
+        preferred = os.environ.get("QUANTIZATION_MODE", "4bit").strip().lower()
+        if preferred in {"4bit", "8bit"}:
+            quantization_candidates = [preferred, "8bit" if preferred == "4bit" else "4bit"]
+        else:
+            quantization_candidates = ["4bit", "8bit"]
+
+    model = None
+    quantization_error: Optional[Exception] = None
+    chosen_quant_mode: Optional[str] = None
+    for mode in quantization_candidates:
+        try:
+            if mode == "4bit":
+                quant_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.float16,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                )
+            elif mode == "8bit":
+                quant_config = BitsAndBytesConfig(load_in_8bit=True)
             else:
-                quantization_candidates = ["4bit", "8bit"]
+                continue
 
-        model = None
-        quantization_error: Optional[Exception] = None
-        for mode in quantization_candidates:
-            try:
-                if mode == "4bit":
-                    quant_config = BitsAndBytesConfig(
-                        load_in_4bit=True,
-                        bnb_4bit_compute_dtype=torch.float16,
-                        bnb_4bit_use_double_quant=True,
-                        bnb_4bit_quant_type="nf4",
-                    )
-                elif mode == "8bit":
-                    quant_config = BitsAndBytesConfig(load_in_8bit=True)
-                else:
-                    continue
-
-                model = AutoModelForCausalLM.from_pretrained(
-                    model_id,
-                    trust_remote_code=True,
-                    low_cpu_mem_usage=True,
-                    use_safetensors=True,
-                    quantization_config=quant_config,
-                    device_map="auto",
-                )
-                optimization["quantization"] = f"bnb-{mode}"
-                break
-            except (ValueError, FileNotFoundError, OSError) as err:
-                quantization_error = err
-                print(
-                    f"[startup] Quantized load ({mode}) unavailable, will retry/fallback: {err}",
-                    flush=True,
-                )
-                model = None
-            except Exception as err:
-                quantization_error = err
-                print(f"[startup] Quantized load ({mode}) failed: {err}", flush=True)
-                model = None
-
-        if model is None:
-            if quantization_candidates and quantization_error is not None:
-                print("[startup] Falling back to full-precision weights.", flush=True)
             model = AutoModelForCausalLM.from_pretrained(
                 model_id,
                 trust_remote_code=True,
-                torch_dtype=DTYPE,
                 low_cpu_mem_usage=True,
                 use_safetensors=True,
+                quantization_config=quant_config,
+                device_map="auto",
             )
-            model.to(DEVICE)
+            optimization["quantization"] = f"bnb-{mode}"
+            chosen_quant_mode = mode
+            break
+        except (ValueError, FileNotFoundError, OSError) as err:
+            quantization_error = err
+            print(
+                f"[startup] Quantized load ({mode}) unavailable, will retry/fallback: {err}",
+                flush=True,
+            )
+            model = None
+        except Exception as err:
+            quantization_error = err
+            print(f"[startup] Quantized load ({mode}) failed: {err}", flush=True)
+            model = None
 
-        model.eval()
-
-        if _env_flag("ENABLE_BETTERTRANSFORMER", "1") and hasattr(model, "to_bettertransformer"):
-            try:
-                model = model.to_bettertransformer()
-                optimization["bettertransformer"] = True
-            except Exception as err:
-                print(f"[startup] to_bettertransformer() failed: {err}", flush=True)
-
-        def _torch_version_at_least(major: int, minor: int) -> bool:
-            ver_str = torch.__version__.split("+")[0]
-            parts = ver_str.split(".")
-            try:
-                ver_nums = [int(p) for p in parts[:3]]
-            except ValueError:
-                ver_nums = [0, 0, 0]
-            ver_nums += [0] * (3 - len(ver_nums))
-            return (ver_nums[0], ver_nums[1]) >= (major, minor)
-
-        if (
-            _env_flag("ENABLE_TORCH_COMPILE", "0")
-            and hasattr(torch, "compile")
-            and _torch_version_at_least(2, 1)
-            and optimization.get("quantization") == "none"
-        ):
-            try:
-                model = torch.compile(model)
-                optimization["compiled"] = True
-            except Exception as err:
-                print(f"[startup] torch.compile failed: {err}", flush=True)
-
-        OPTIMIZATION_INFO = optimization
-        PROFILE_INFO["optimizations"] = dict(optimization)
-        ctx_limit = int(getattr(model.config, "max_position_embeddings", MODEL_CTX_LIMIT))
-        MODEL_CTX_LIMIT = ctx_limit
-        ctx_cap = max(128, ctx_limit - 128)
-        MAX_NEW_CAP = min(MAX_NEW_CAP, ctx_cap)
-        PROFILE_INFO["max_context_tokens"] = ctx_limit
-        PROFILE_INFO.setdefault("defaults", PROFILE_DEFAULTS)
-        PROFILE_INFO["defaults"]["max_new_cap"] = MAX_NEW_CAP
-        PROFILE_INFO["defaults"]["max_new_tokens"] = min(
-            PROFILE_INFO["defaults"].get("max_new_tokens", DEFAULT_MAX_NEW_TOKENS), MAX_NEW_CAP
+    if model is None:
+        if quantization_candidates and quantization_error is not None:
+            print("[startup] Falling back to full-precision weights.", flush=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            torch_dtype=DTYPE,
+            low_cpu_mem_usage=True,
+            use_safetensors=True,
         )
-        for meta in PROFILE_INFO.get("modes", {}).values():
-            if not isinstance(meta, dict):
-                continue
-            if "max_new_tokens" in meta:
-                meta["max_new_tokens"] = int(min(meta["max_new_tokens"], MAX_NEW_CAP))
-            if "max_time_s" in meta:
-                meta["max_time_s"] = float(max(5.0, meta["max_time_s"]))
+        model.to(DEVICE)
 
-        # Ensure eos/pad are set to avoid hanging on some models
-        if model.config.eos_token_id is None and tok.eos_token_id is not None:
-            model.config.eos_token_id = tok.eos_token_id
-        if model.config.pad_token_id is None:
-            model.config.pad_token_id = tok.eos_token_id or tok.pad_token_id
+    model.eval()
 
-        if quantize:
-            if torch.cuda.is_available():
-                pipe_device = 0
-            elif IS_MPS:
-                pipe_device = DEVICE
-            else:
-                pipe_device = -1
-        else:
+    if _env_flag("ENABLE_BETTERTRANSFORMER", "1") and hasattr(model, "to_bettertransformer"):
+        try:
+            model = model.to_bettertransformer()
+            optimization["bettertransformer"] = True
+        except Exception as err:
+            print(f"[startup] to_bettertransformer() failed: {err}", flush=True)
+
+    def _torch_version_at_least(major: int, minor: int) -> bool:
+        ver_str = torch.__version__.split("+")[0]
+        parts = ver_str.split(".")
+        try:
+            ver_nums = [int(p) for p in parts[:3]]
+        except ValueError:
+            ver_nums = [0, 0, 0]
+        ver_nums += [0] * (3 - len(ver_nums))
+        return (ver_nums[0], ver_nums[1]) >= (major, minor)
+
+    if (
+        _env_flag("ENABLE_TORCH_COMPILE", "0")
+        and hasattr(torch, "compile")
+        and _torch_version_at_least(2, 1)
+        and optimization.get("quantization") == "none"
+    ):
+        try:
+            model = torch.compile(model)
+            optimization["compiled"] = True
+        except Exception as err:
+            print(f"[startup] torch.compile failed: {err}", flush=True)
+
+    OPTIMIZATION_INFO = optimization
+    PROFILE_INFO["optimizations"] = dict(optimization)
+
+    ctx_limit = int(getattr(model.config, "max_position_embeddings", MODEL_CTX_LIMIT))
+    MODEL_CTX_LIMIT = ctx_limit
+    ctx_cap = max(128, ctx_limit - 128)
+    MAX_NEW_CAP = min(MAX_NEW_CAP, ctx_cap)
+    PROFILE_INFO["max_context_tokens"] = ctx_limit
+    PROFILE_INFO.setdefault("defaults", PROFILE_DEFAULTS)
+    PROFILE_INFO["defaults"]["max_new_cap"] = MAX_NEW_CAP
+    PROFILE_INFO["defaults"]["max_new_tokens"] = min(
+        PROFILE_INFO["defaults"].get("max_new_tokens", DEFAULT_MAX_NEW_TOKENS), MAX_NEW_CAP
+    )
+    for meta in PROFILE_INFO.get("modes", {}).values():
+        if not isinstance(meta, dict):
+            continue
+        if "max_new_tokens" in meta:
+            meta["max_new_tokens"] = int(min(meta["max_new_tokens"], MAX_NEW_CAP))
+        if "max_time_s" in meta:
+            meta["max_time_s"] = float(max(5.0, meta["max_time_s"]))
+
+    if model.config.eos_token_id is None and tok.eos_token_id is not None:
+        model.config.eos_token_id = tok.eos_token_id
+    if model.config.pad_token_id is None:
+        model.config.pad_token_id = tok.eos_token_id or tok.pad_token_id
+
+    quantization_used = optimization.get("quantization", "none") != "none"
+    if quantization_used:
+        if torch.cuda.is_available():
+            pipe_device = 0
+        elif IS_MPS:
             pipe_device = DEVICE
+        else:
+            pipe_device = -1
+    else:
+        pipe_device = DEVICE
 
-        text_gen = pipeline("text-generation", model=model, tokenizer=tok, device=pipe_device)
-        _PIPE = text_gen
-        _TOKENIZER = tok
-        _READY = True
-        _LAST_ERROR = None
-        _HARDWARE_STATE.update(
+    text_gen = pipeline("text-generation", model=model, tokenizer=tok, device=pipe_device)
+    _PIPE = text_gen
+    _TOKENIZER = tok
+    _READY = True
+    _LAST_ERROR = None
+
+    if quantization_used and chosen_quant_mode:
+        _ACTIVE_PRECISION = chosen_quant_mode
+    else:
+        if DTYPE == torch.bfloat16:
+            _ACTIVE_PRECISION = "bf16"
+        elif DTYPE == torch.float16:
+            _ACTIVE_PRECISION = "fp16"
+        else:
+            _ACTIVE_PRECISION = "full"
+
+    _HARDWARE_STATE.update(
+        {
+            "cpu_capability": cpu_cap,
+            "cpu_bf16": cpu_bf16,
+            "vram_gb": vram_gb,
+            "quantization_mode": optimization.get("quantization", MODEL_QUANTIZATION),
+            "active_precision": _ACTIVE_PRECISION,
+        }
+    )
+
+    msg = f"[startup] Model loaded: {model_id} (precision={_ACTIVE_PRECISION}, device={DEVICE}, MPS={IS_MPS})"
+    if vram_gb is not None:
+        msg += f" [VRAM: {vram_gb} GB]"
+    msg += f" [CPU: {cpu_cap}, bf16={cpu_bf16}]"
+    print(msg, flush=True)
+
+
+def _load_pipeline():
+    global _PIPE, _TOKENIZER, _READY, _LAST_ERROR, MODEL_ID, _USING_FALLBACK_MODEL, _FALLBACK_ACTIVATION_REASON
+
+    cpu_cap = _detect_cpu_capability()
+    cpu_bf16 = _cpu_supports_bf16()
+    vram_gb = _detect_vram_gb()
+
+    skip_primary_reason_env = None
+    if _env_flag("FORCE_FALLBACK_MODEL", "0") or _env_flag("FORCE_DUMMY_MODEL", "0"):
+        if FALLBACK_MODEL_ID:
+            skip_primary_reason_env = "FORCE_FALLBACK_MODEL=1"
+        else:
+            print("[startup] FORCE_FALLBACK_MODEL set but no FALLBACK_MODEL_ID provided; loading primary model.", flush=True)
+
+    candidates = [
+        {"id": PRIMARY_MODEL_ID, "min_ram": MIN_MODEL_RAM_GB, "fallback": False},
+    ]
+    if FALLBACK_MODEL_ID and (FALLBACK_MODEL_ID != PRIMARY_MODEL_ID or skip_primary_reason_env):
+        candidates.append(
             {
-                "cpu_capability": cpu_cap,
-                "cpu_bf16": cpu_bf16,
-                "vram_gb": vram_gb,
-                "quantization_mode": MODEL_QUANTIZATION,
-                "active_precision": _ACTIVE_PRECISION,
+                "id": FALLBACK_MODEL_ID,
+                "min_ram": FALLBACK_MIN_MODEL_RAM_GB,
+                "fallback": True,
             }
         )
-        msg = f"[startup] Model loaded: {model_id} (precision={_ACTIVE_PRECISION}, device={DEVICE}, MPS={IS_MPS})"
-        if vram_gb is not None:
-            msg += f" [VRAM: {vram_gb} GB]"
-        msg += f" [CPU: {cpu_cap}, bf16={cpu_bf16}]"
-        print(msg, flush=True)
-    except Exception as e:
-        _READY = False
-        _LAST_ERROR = str(e)
-        print(f"[startup] Model load FAILED: {e}", flush=True)
-        raise
+
+    errors: List[str] = []
+    fallback_reason: Optional[str] = None
+    _USING_FALLBACK_MODEL = False
+    _FALLBACK_ACTIVATION_REASON = None
+
+    for candidate in candidates:
+        model_id = candidate["id"]
+        is_fallback = candidate["fallback"]
+        min_ram = candidate["min_ram"]
+
+        if not is_fallback and skip_primary_reason_env:
+            skip_reason = skip_primary_reason_env
+        else:
+            skip_reason = _memory_guard(min_ram)
+
+        if skip_reason:
+            print(
+                f"[startup] Skipping {'fallback' if is_fallback else 'primary'} model {model_id}: {skip_reason}",
+                flush=True,
+            )
+            errors.append(skip_reason)
+            if not is_fallback:
+                fallback_reason = skip_reason
+            continue
+
+        try:
+            _load_model_candidate(model_id, cpu_cap, cpu_bf16, vram_gb)
+            MODEL_ID = model_id
+            _USING_FALLBACK_MODEL = is_fallback
+            _FALLBACK_ACTIVATION_REASON = fallback_reason
+            _LAST_ERROR = None
+            if is_fallback:
+                note = f" due to {fallback_reason}" if fallback_reason else ""
+                print(f"[startup] Fallback model engaged{note}.", flush=True)
+            else:
+                print("[startup] Primary model ready.", flush=True)
+            return
+        except Exception as err:
+            err_msg = str(err)
+            errors.append(err_msg)
+            print(f"[startup] Model load FAILED ({model_id}): {err_msg}", flush=True)
+            if not is_fallback:
+                fallback_reason = err_msg
+            continue
+
+    _PIPE = None
+    _TOKENIZER = None
+    _READY = False
+    if errors:
+        _LAST_ERROR = errors[-1]
+    else:
+        _LAST_ERROR = "model load failed"
+    raise RuntimeError("Unable to load any configured model candidates")
 
 def ensure_ready():
     if _READY: return
     with _MODEL_LOCK:
         if not _READY:
-            _load_pipeline(MODEL_ID)
+            _load_pipeline()
 
 def _read_session_memory() -> str:
     try:
@@ -668,6 +850,8 @@ def health():
         "cuda": IS_CUDA,
         "optimizations": dict(OPTIMIZATION_INFO),
         "profile": profile,
+        "using_fallback_model": _USING_FALLBACK_MODEL,
+        "fallback_reason": _FALLBACK_ACTIVATION_REASON,
     }
 
 @app.post("/api/chat")
