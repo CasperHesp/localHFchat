@@ -1,24 +1,26 @@
 services:
   chatapp:
-    platform: linux/arm64/v8
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    restart: unless-stopped
     environment:
-      - TRANSFORMERS_CACHE=/app/.cache/huggingface
-      - HF_HOME=/app/.cache/huggingface
-      - HF_HUB_DISABLE_TELEMETRY=1
-      - NUM_THREADS=6
-      - PYTORCH_ENABLE_MPS_FALLBACK=1
-      - MODEL_ID=${MODEL_ID:-Qwen/Qwen2.5-3B-Instruct}
-      - MODEL_QUANTIZATION=${MODEL_QUANTIZATION:-auto}
-      - PORT=${PORT:-8000}
-      - COMPANY_INFO_PATH=/app/brainbay_company.txt
-      - BRAINBAY_MARKET_PATH=/app/brainbay_market.txt
-      - BRAINBAY_GEOGRAPHY_PATH=/app/brainbay_geography.txt
-      - BRAINBAY_MATCHING_PATH=/app/brainbay_matching.txt
-    command: ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+      TRANSFORMERS_CACHE: /app/.cache/huggingface
+      HF_HOME: /app/.cache/huggingface
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      NUM_THREADS: ${NUM_THREADS:-6}
+      PYTORCH_ENABLE_MPS_FALLBACK: "1"
+      MODEL_ID: ${MODEL_ID:-Qwen/Qwen2.5-3B-Instruct}
+      MODEL_QUANTIZATION: ${MODEL_QUANTIZATION:-auto}
+      PORT: ${PORT:-8000}
+      COMPANY_INFO_PATH: /app/brainbay_company.txt
+      BRAINBAY_MARKET_PATH: /app/brainbay_market.txt
+      BRAINBAY_GEOGRAPHY_PATH: /app/brainbay_geography.txt
+      BRAINBAY_MATCHING_PATH: /app/brainbay_matching.txt
     ports:
       - target: ${PORT:-8000}
-        published: 0
+        published: ${HOST_PORT:-0}
         protocol: tcp
     volumes:
       - hf_cache:/app/.cache/huggingface
