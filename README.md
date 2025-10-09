@@ -9,6 +9,9 @@ docker compose up --build -d
 # Find the URL to open
 docker compose port chatapp 8000
 # -> http://localhost:XXXXX
+
+# (optional) force precision: auto (default), full, or 4bit quantized
+MODEL_QUANTIZATION=4bit docker compose up --build -d
 ```
 
 ## What it is
@@ -57,7 +60,7 @@ project-root/
 
 ## Tech summary
 
-* **Backend:** FastAPI + Uvicorn, Hugging Face **Transformers**, **PyTorch** (+ Apple **MPS** on macOS), Accelerate
+* **Backend:** FastAPI + Uvicorn, Hugging Face **Transformers**, **PyTorch** (+ Apple **MPS** on macOS), Accelerate, optional **bitsandbytes** 4-bit quantization
 * **Frontend:** custom vanilla **HTML/CSS/JS** (no UI framework)
 * **Container:** Docker, docker-compose + edge-(pre-)computation
 
@@ -78,9 +81,12 @@ project-root/
 # (optional) choose a small public HF model
 export MODEL_ID="Qwen/Qwen2.5-0.5B-Instruct"
 
+# (optional) choose precision (full keeps float32/float16; auto detects; 4bit forces quantized)
+export MODEL_QUANTIZATION="full"
+
 python3 -m venv .venv && source .venv/bin/activate
 python -m pip install --upgrade pip wheel
-pip install -r requirements.txt   # or: requirements-macos.txt
+pip install -r requirements.txt   # markers avoid installing bitsandbytes on macOS
 
 # run on a free port
 PORT=$(python - <<'PY'
@@ -91,6 +97,11 @@ export PYTORCH_ENABLE_MPS_FALLBACK=1
 uvicorn backend.app.main:app --host 0.0.0.0 --port "$PORT"
 # open http://localhost:$PORT
 ```
+
+### Precision heuristics & health endpoint
+
+* `MODEL_QUANTIZATION` can be `auto` (default), `full`, or `4bit`. Auto enables 4-bit loading when VRAM is low or CPU lacks AVX512/bfloat16 support.
+* `/api/health` now reports the active precision & heuristic throughput profile so the UI can surface it in the status bar.
 
 
 ## Concluding note

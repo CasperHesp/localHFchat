@@ -14,7 +14,7 @@ COPY brainbay_market.txt /app/brainbay_market.txt
 COPY brainbay_geography.txt /app/brainbay_geography.txt
 COPY brainbay_matching.txt /app/brainbay_matching.txt
 
-ENV TRANSFORMERS_CACHE=/app/.cache/huggingface HF_HOME=/app/.cache/huggingface HF_HUB_DISABLE_TELEMETRY=1 PORT=8000 COMPANY_INFO_PATH=/app/brainbay_company.txt BRAINBAY_MARKET_PATH=/app/brainbay_market.txt BRAINBAY_GEOGRAPHY_PATH=/app/brainbay_geography.txt BRAINBAY_MATCHING_PATH=/app/brainbay_matching.txt
+ENV TRANSFORMERS_CACHE=/app/.cache/huggingface HF_HOME=/app/.cache/huggingface HF_HUB_DISABLE_TELEMETRY=1 PORT=8000 COMPANY_INFO_PATH=/app/brainbay_company.txt BRAINBAY_MARKET_PATH=/app/brainbay_market.txt BRAINBAY_GEOGRAPHY_PATH=/app/brainbay_geography.txt BRAINBAY_MATCHING_PATH=/app/brainbay_matching.txt MODEL_QUANTIZATION=auto
 
 EXPOSE 8000
 
