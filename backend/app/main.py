@@ -346,6 +346,33 @@ _HARDWARE_STATE: Dict[str, Optional[float]] = {
 MIN_MODEL_RAM_GB = float(os.environ.get("MIN_MODEL_RAM_GB", "3.0"))
 
 
+def _launch_background_warmup() -> None:
+    global _WARM_THREAD, _LAST_ERROR
+
+    if _READY:
+        return
+
+    with _WARM_LOCK:
+        if _READY:
+            return
+
+        thread = _WARM_THREAD
+        if thread is not None and thread.is_alive():
+            return
+
+        def _runner() -> None:
+            global _LAST_ERROR
+            try:
+                ensure_ready()
+            except Exception as exc:  # pragma: no cover - startup best effort
+                # Capture the exception so the health endpoint can surface it
+                _LAST_ERROR = str(exc)
+
+        thread = threading.Thread(target=_runner, name="model-warmup", daemon=True)
+        _WARM_THREAD = thread
+        thread.start()
+
+
 def _detect_cpu_capability() -> str:
     try:
         return str(torch.backends.cpu.get_cpu_capability())
