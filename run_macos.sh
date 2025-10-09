@@ -10,6 +10,7 @@ python -m pip install --upgrade pip wheel
 pip install -r requirements.txt
 
 export MODEL_ID="${MODEL_ID_ARG}"
+export MODEL_QUANTIZATION="${MODEL_QUANTIZATION:-full}"
 export NUM_THREADS="${NUM_THREADS:-6}"
 export PYTORCH_ENABLE_MPS_FALLBACK=1
 

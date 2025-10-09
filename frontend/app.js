@@ -16,12 +16,15 @@ const state = {
     system_prompt: localStorage.getItem('system_prompt') || DEFAULT_SYS,
     context_key: localStorage.getItem('context_key') || 'market',
     refine: localStorage.getItem('refine') || 'model',
-    use_memory: JSON.parse(localStorage.getItem('use_memory') || 'false')
+    use_memory: JSON.parse(localStorage.getItem('use_memory') || 'false'),
+    performance_mode: localStorage.getItem('performance_mode') || 'balanced'
   },
   starters: null,   // conversation_starters.json
   intro: null,      // intro_markdown.json
   idleTimer: null,
-  sessionMemory: localStorage.getItem('session_memory_text') || ''
+  sessionMemory: localStorage.getItem('session_memory_text') || '',
+  profile: null,
+  health: { ready: false, error: null }
 };
 
 function save() {
@@ -31,11 +34,98 @@ function save() {
   localStorage.setItem('context_key', state.settings.context_key);
   localStorage.setItem('refine', state.settings.refine);
   localStorage.setItem('use_memory', JSON.stringify(state.settings.use_memory));
+  localStorage.setItem('performance_mode', state.settings.performance_mode);
   localStorage.setItem('session_memory_text', state.sessionMemory);
 }
 
 const uid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
 const currentConv = () => state.conversations.find(c => c.id === state.currentId) || null;
+
+const numberFmt = new Intl.NumberFormat('en-US');
+
+function ensureCurrentModeKey() {
+  const modes = state.profile?.modes || {};
+  if (!Object.keys(modes).length) return state.settings.performance_mode || 'balanced';
+  const current = state.settings.performance_mode;
+  if (current && modes[current]) return current;
+  const fallback = (state.profile?.default_mode && modes[state.profile.default_mode])
+    ? state.profile.default_mode
+    : Object.keys(modes)[0];
+  return fallback || 'balanced';
+}
+
+function currentModeMeta() {
+  const key = ensureCurrentModeKey();
+  return { key, meta: (state.profile?.modes && state.profile.modes[key]) || {} };
+}
+
+function formatModelId(id) {
+  if (!id) return '—';
+  const last = id.split('/').pop();
+  return last ? last.replace(/_/g, ' ') : id;
+}
+
+function updateStatusUI() {
+  const indicator = el('#statusIndicator');
+  const statusText = el('#statusText');
+  const ready = !!state.health?.ready;
+  const hasError = !!state.health?.error;
+  if (indicator) {
+    indicator.classList.toggle('ready', ready);
+    indicator.classList.toggle('error', hasError && !ready);
+    indicator.title = hasError ? state.health.error : (ready ? 'Model loaded' : 'Model warming up');
+  }
+  if (statusText) {
+    statusText.textContent = ready ? 'Model ready' : (hasError ? 'Retrying model…' : 'Loading model…');
+  }
+
+  const modelEl = el('#statusModel');
+  if (modelEl) {
+    const id = state.health?.model_id;
+    const size = state.profile?.model_size ? `· ${state.profile.model_size}` : '';
+    modelEl.textContent = id ? `${formatModelId(id)} ${size}`.trim() : '—';
+  }
+
+  const deviceEl = el('#statusDevice');
+  if (deviceEl) {
+    const parts = [];
+    if (state.health?.device) parts.push(state.health.device);
+    if (state.health?.dtype) parts.push(String(state.health.dtype));
+    if (state.health?.threads) parts.push(`${state.health.threads} threads`);
+    deviceEl.textContent = parts.length ? parts.join(' • ') : '—';
+  }
+
+  const { key: modeKey, meta } = currentModeMeta();
+  const defaults = state.profile?.defaults || {};
+  const budgetEl = el('#statusBudget');
+  if (budgetEl) {
+    const pieces = [];
+    const tokens = meta?.max_new_tokens || defaults.max_new_tokens;
+    const time = meta?.max_time_s || defaults.max_time_s;
+    if (tokens) pieces.push(`${numberFmt.format(Math.round(tokens))} tokens`);
+    if (time) pieces.push(`${Math.round(time)} s window`);
+    if (state.profile?.max_context_tokens) pieces.push(`${numberFmt.format(state.profile.max_context_tokens)} ctx`);
+    budgetEl.textContent = pieces.length ? pieces.join(' • ') : '—';
+  }
+
+  const modeHint = el('#modeHint');
+  if (modeHint) {
+    modeHint.textContent = meta?.description || 'Adjusts response length and latency.';
+  }
+
+  const perfSelect = el('#perfMode');
+  if (perfSelect) {
+    const modes = state.profile?.modes || {};
+    Array.from(perfSelect.options).forEach(opt => {
+      const emoji = opt.dataset.emoji || '';
+      const info = modes[opt.value];
+      if (info?.label) {
+        opt.textContent = emoji ? `${emoji} ${info.label}` : info.label;
+      }
+    });
+    if (perfSelect.value !== modeKey) perfSelect.value = modeKey;
+  }
+}
 
 // --- Markdown renderer (simple, sanitized) ---
 const escapeHtml = (s) => s.replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
@@ -185,10 +275,14 @@ async function sendMessage(text) {
   conv.messages.push({ role: 'user', content: text }); save(); renderChat();
   el('#sendBtn').disabled = true; el('#sendBtn').textContent = '...'; showTyping();
 
+  let assistantMsg = null;
+  let reader = null;
+  let finalMeta = null;
+  let streamError = null;
+
   try {
     let ctx = conv.messages.slice(-12);
 
-    // Build system prompt (+session memory if enabled)
     const sysParts = [state.settings.system_prompt];
     if (state.settings.use_memory && state.sessionMemory.trim()) {
       sysParts.push("\n\n[Session memory]\n" + state.sessionMemory.trim());
@@ -198,17 +292,52 @@ async function sendMessage(text) {
     if (!ctx.find(m => m.role === 'system')) ctx = [{ role: 'system', content: sysCombined }, ...ctx];
     else ctx = ctx.map(m => m.role === 'system' ? {...m, content: sysCombined} : m);
 
-    // Hidden tuned sampling
+    const { key: modeKey, meta: modeMeta } = currentModeMeta();
+    if (state.settings.performance_mode !== modeKey) {
+      state.settings.performance_mode = modeKey;
+      save();
+    }
+    const defaults = state.profile?.defaults || {};
+    const temperature = modeMeta?.temperature ?? defaults.temperature ?? 0.3;
+    const topP = modeMeta?.top_p ?? defaults.top_p ?? 0.95;
+    const repetition = modeMeta?.repetition_penalty ?? defaults.repetition_penalty ?? 1.05;
+    const noRepeat = modeMeta?.no_repeat_ngram_size ?? defaults.no_repeat_ngram_size ?? 3;
+    const maxTime = modeMeta?.max_time_s ?? defaults.max_time_s;
+
     const payload = {
       messages: ctx,
-      temperature: 0.3,
-      top_p: 0.95,
-      repetition_penalty: 1.05,
+      temperature,
+      top_p: topP,
+      repetition_penalty: repetition,
       deterministic: false,
-      max_new_tokens: 512,              // let backend auto-budget tokens
+      max_new_tokens: null,
+      max_time_s: maxTime,
+      no_repeat_ngram_size: noRepeat,
       context_key: state.settings.context_key,
-      refine: state.settings.refine,     // defaults to "model"
-      refine_iters: 1
+      refine: state.settings.refine,
+      refine_iters: 1,
+      performance_mode: modeKey
+    };
+    if (payload.max_time_s == null) delete payload.max_time_s;
+    payload.no_repeat_ngram_size = Math.max(1, Math.round(payload.no_repeat_ngram_size || 3));
+
+    assistantMsg = { role: 'assistant', content: '' };
+    conv.messages.push(assistantMsg);
+    save();
+    renderChat();
+
+    const chatEl = el('#chat');
+    const getAssistantContentEl = () => {
+      const nodes = chatEl.querySelectorAll('.msg.assistant .content');
+      return nodes.length ? nodes[nodes.length - 1] : null;
+    };
+    let assistantContentEl = getAssistantContentEl();
+    const applyAssistantContent = () => {
+      if (!assistantContentEl) assistantContentEl = getAssistantContentEl();
+      if (assistantContentEl) {
+        assistantContentEl.innerHTML = mdToHtml(assistantMsg.content);
+        chatEl.scrollTop = chatEl.scrollHeight;
+      }
     };
 
     currentAbort = new AbortController();
@@ -222,17 +351,112 @@ async function sendMessage(text) {
       const err = await res.json().catch(() => ({}));
       throw new Error(err.detail || res.statusText);
     }
-    const data = await res.json();
-    conv.messages.push({ role: 'assistant', content: data.content });
+    if (!res.body) {
+      throw new Error('Streaming not supported in this browser.');
+    }
+
+    reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    const handlePayload = (payload) => {
+      if (!payload || typeof payload !== 'object') return;
+      if (payload.type === 'token' && typeof payload.token === 'string') {
+        assistantMsg.content += payload.token;
+        applyAssistantContent();
+      } else if (payload.type === 'end') {
+        if (typeof payload.content === 'string') {
+          assistantMsg.content = payload.content;
+        }
+        finalMeta = payload;
+        if (payload.mode && state.settings.performance_mode !== payload.mode) {
+          state.settings.performance_mode = payload.mode;
+          save();
+          updateStatusUI();
+        }
+        applyAssistantContent();
+      } else if (payload.type === 'error') {
+        throw new Error(payload.error || 'Generation failed.');
+      }
+    };
+
+    const processBuffer = () => {
+      while (true) {
+        const idx = buffer.indexOf('\n');
+        if (idx < 0) break;
+        const raw = buffer.slice(0, idx).replace(/\r$/, '');
+        buffer = buffer.slice(idx + 1);
+        if (!raw) continue;
+        let payload;
+        try {
+          payload = JSON.parse(raw);
+        } catch (_) {
+          continue;
+        }
+        try {
+          handlePayload(payload);
+        } catch (err) {
+          streamError = err;
+          return;
+        }
+        if (finalMeta) return;
+      }
+    };
+
+    while (!finalMeta && !streamError) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      processBuffer();
+    }
+
+    if (!streamError) {
+      buffer += decoder.decode();
+      processBuffer();
+    }
+
+    if (streamError) throw streamError;
+    if (!finalMeta) throw new Error('Generation ended unexpectedly.');
+
+    if (finalMeta.stop_reason === 'timeout') {
+      assistantMsg.content = assistantMsg.content.trimEnd() + '\n\n_[stopped early: timeout]_';
+    } else if (finalMeta.stop_reason === 'cancelled') {
+      assistantMsg.content = assistantMsg.content.trimEnd() + '\n\n_[generation cancelled]_';
+    }
+    applyAssistantContent();
+
     if (!conv.title || conv.title === 'New chat') conv.title = (text.length > 30 ? text.slice(0, 30) + '…' : text);
-    save(); renderChat();
+    save();
+    renderChat();
   } catch (e) {
     if (e.name === 'AbortError') {
-      const conv = currentConv(); if (conv) { conv.messages.push({ role: 'assistant', content: '_[stopped by user]_' }); save(); renderChat(); }
+      if (assistantMsg) {
+        assistantMsg.content = assistantMsg.content.trimEnd();
+        if (assistantMsg.content) {
+          assistantMsg.content += '\n\n_[stopped by user]_';
+        } else {
+          conv.messages.pop();
+          conv.messages.push({ role: 'assistant', content: '_[stopped by user]_' });
+        }
+        save();
+        renderChat();
+      } else {
+        conv.messages.push({ role: 'assistant', content: '_[stopped by user]_' });
+        save();
+        renderChat();
+      }
     } else {
+      if (assistantMsg) {
+        conv.messages = conv.messages.filter(m => m !== assistantMsg);
+      }
+      save();
+      renderChat();
       alert('Error: ' + e.message);
     }
   } finally {
+    if (reader) {
+      try { await reader.cancel(); } catch (_) {}
+    }
     el('#sendBtn').disabled = false; el('#sendBtn').textContent = 'Send'; hideTyping(); currentAbort = null; resetIdleTimer();
   }
 }
@@ -240,26 +464,34 @@ async function sendMessage(text) {
 // --- Health & boot ---
 async function checkHealthLoop() {
   const overlay = el('#loadingScreen');
+  let delay = 4000;
   try {
-    const res = await fetch('/api/health'); const j = await res.json();
+    const res = await fetch('/api/health');
+    const j = await res.json();
+    state.health = { ...(state.health || {}), ...j, error: j.last_error || null };
+    if (j.profile) {
+      state.profile = j.profile;
+    }
+    const validMode = ensureCurrentModeKey();
+    if (state.settings.performance_mode !== validMode) {
+      state.settings.performance_mode = validMode;
+      save();
+    }
     if (!j.ready) {
-      overlay.classList.remove('hidden');
-      setTimeout(checkHealthLoop, 1500);
-      return;
+      overlay?.classList.remove('hidden');
+      delay = 1800;
     } else {
-      if (sessionStorage.getItem('reloadedAfterReady') !== '1' && (overlay && !overlay.classList.contains('hidden'))) {
-        sessionStorage.setItem('reloadedAfterReady', '1');
-        location.reload();
-        return;
-      }
-      overlay.classList.add('hidden');
-      sessionStorage.removeItem('reloadedAfterReady');
+      overlay?.classList.add('hidden');
+      delay = 10000;
     }
   } catch (e) {
-    overlay.classList.remove('hidden');
-    setTimeout(checkHealthLoop, 2500);
-    return;
+    const msg = e?.message || 'Network error';
+    state.health = { ...(state.health || {}), ready: false, error: msg };
+    overlay?.classList.remove('hidden');
+    delay = 4000;
   }
+  updateStatusUI();
+  setTimeout(checkHealthLoop, delay);
 }
 
 function bindUI() {
@@ -274,12 +506,25 @@ function bindUI() {
   el('#downloadMemoryBtn').addEventListener('click', downloadMemory);
   el('#stopBtn').addEventListener('click', () => { if (currentAbort) currentAbort.abort(); });
 
-  const sys = el('#sysPrompt'); const ctxSel = el('#contextKey'); const useMem = el('#useMemory');
+  const sys = el('#sysPrompt'); const ctxSel = el('#contextKey'); const useMem = el('#useMemory'); const perfSel = el('#perfMode');
   sys.value = state.settings.system_prompt; ctxSel.value = state.settings.context_key; useMem.checked = state.settings.use_memory;
+  if (perfSel) {
+    const mode = ensureCurrentModeKey();
+    if (state.settings.performance_mode !== mode) {
+      state.settings.performance_mode = mode;
+      save();
+    }
+    perfSel.value = mode;
+  }
 
   sys.addEventListener('input', () => { state.settings.system_prompt = sys.value; save(); resetIdleTimer(); });
   ctxSel.addEventListener('change', () => { state.settings.context_key = ctxSel.value; save(); resetIdleTimer(); });
   useMem.addEventListener('change', () => { state.settings.use_memory = useMem.checked; save(); resetIdleTimer(); });
+  perfSel?.addEventListener('change', () => {
+    state.settings.performance_mode = perfSel.value;
+    save();
+    updateStatusUI();
+  });
 
   // dark mode
   const toggle = el('#themeToggle');
@@ -316,6 +561,7 @@ async function boot() {
 
   if (state.conversations.length === 0) newConversation(); else { renderConversations(); renderChat(); }
   bindUI();
+  updateStatusUI();
   resetIdleTimer();
   checkHealthLoop();
 }

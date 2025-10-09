@@ -6,10 +6,22 @@
 # Build & start (publishes a RANDOM host port for container port 8000)
 docker compose up --build -d
 
-# Find the URL to open
+# Find the URL to open (prints something like http://localhost:XXXXX)
 docker compose port chatapp 8000
-# -> http://localhost:XXXXX
+
+# (optional) force precision: auto (default), full, or 4bit quantized
+MODEL_QUANTIZATION=4bit docker compose up --build -d
+
+# (optional) pin a host port instead of a random one
+HOST_PORT=5173 docker compose up --build -d
 ```
+
+### Helper scripts
+
+* **macOS / Linux** – `./run_docker.sh` automatically builds, starts, opens the browser (using `open`, `xdg-open`, or `powershell.exe` on WSL), and tails logs.
+* **Windows PowerShell** – `pwsh ./scripts/run-windows.ps1` (or `powershell` on Windows). It mirrors the shell script behaviour and works out-of-the-box with Docker Desktop.
+
+> Tip: copy `.env.example` to `.env` to customise defaults (`MODEL_ID`, `HOST_PORT`, etc.) without editing the compose file.
 
 ## What it is
 
@@ -28,6 +40,7 @@ project-root/
     app.js
     conversation_starters.json
     intro_markdown.json
+  backend/requirements/base.txt
   brainbay_company.txt
   brainbay_market.txt
   brainbay_geography.txt
@@ -35,12 +48,16 @@ project-root/
   session_memory.txt
   Dockerfile
   docker-compose.yml
+  infra/docker/entrypoint.sh
   run_macos.sh
+  run_docker.sh
+  scripts/run-windows.ps1
   requirements.txt
 ```
 
 * **backend/app/main.py** — FastAPI app. Loads a small HF chat model; merges context **as data** (system → company → selected dropdown file → optional session memory); adds guardrails (timeout, no-repeat, tuned sampling); serves `/static` + UI.
-* **frontend/index.html / style.css / app.js** — Small custom UI: Markdown render, “Thinking…” spinner, **Stop**, intro markdown (per context), **10s kickstart** prompts, export/import history, dark mode, session memory (summarize & save + download).
+* **frontend/index.html / style.css / app.js** — Small custom UI: Markdown render, “Thinking…” spinner, **Stop**, intro markdown (per context), **10s kickstart** prompts, export/import history, dark mode, session memory (summarize & save + download), plus a live status bar with hardware/model insights and a fast/balanced/quality mode switcher.
+* **backend/requirements/base.txt** — Canonical Python dependency list shared by the Docker image and local scripts.
 * **conversation_starters.json** — Content-only list of kickstart prompts per context (edit without touching code).
 * **intro_markdown.json** — One intro block per context, shown once at chat start.
 * **brainbay_*.txt** — **Demo** context files (company / market / geography / matching). Swappable via env vars.
@@ -57,7 +74,7 @@ project-root/
 
 ## Tech summary
 
-* **Backend:** FastAPI + Uvicorn, Hugging Face **Transformers**, **PyTorch** (+ Apple **MPS** on macOS), Accelerate
+* **Backend:** FastAPI + Uvicorn, Hugging Face **Transformers**, **PyTorch** (+ Apple **MPS** on macOS), Accelerate, optional **bitsandbytes** 4-bit quantization
 * **Frontend:** custom vanilla **HTML/CSS/JS** (no UI framework)
 * **Container:** Docker, docker-compose + edge-(pre-)computation
 
@@ -68,6 +85,7 @@ project-root/
 * **[EDGE:contextually compressed data]**: Behavior steered by editable text/JSON files; no rebuilds to change domain knowledge. Sensitive data can be safely and bijectively pseudonymised elsewhere (i.e.,ensuring security & recoverability).
 * **[CORE: on-device ergonomics]:** Tuned decoding (`temperature=0.3`, `top_p=0.95`, `top_k=40`, `repetition_penalty=1.05`), **auto token budgeting**, `no_repeat_ngram_size=3`, **timeout guard** (default 12s) to reduce stalls/loops.
 * **[SENSE: responsive UI/UX]**: Markdown, spinner, **Stop**, intro per context, **10s kickstart**, export/import, dark mode, session memory with summarization.
+* **[FLOW: adaptive scaling]**: Backend inspects the runtime (CPU vs GPU/MPS) and model size to auto-tune dtype, token/time budgets and three preset “Fast / Balanced / Quality” modes surfaced in the UI via a live status bar (model/device/budget).
 
 ---
 
@@ -77,9 +95,12 @@ project-root/
 # (optional) choose a small public HF model
 export MODEL_ID="Qwen/Qwen2.5-0.5B-Instruct"
 
+# (optional) choose precision (full keeps float32/float16; auto detects; 4bit forces quantized)
+export MODEL_QUANTIZATION="full"
+
 python3 -m venv .venv && source .venv/bin/activate
 python -m pip install --upgrade pip wheel
-pip install -r requirements.txt   # or: requirements-macos.txt
+pip install -r requirements.txt   # markers avoid installing bitsandbytes on macOS
 
 # run on a free port
 PORT=$(python - <<'PY'
@@ -90,6 +111,11 @@ export PYTORCH_ENABLE_MPS_FALLBACK=1
 uvicorn backend.app.main:app --host 0.0.0.0 --port "$PORT"
 # open http://localhost:$PORT
 ```
+
+### Precision heuristics & health endpoint
+
+* `MODEL_QUANTIZATION` can be `auto` (default), `full`, or `4bit`. Auto enables 4-bit loading when VRAM is low or CPU lacks AVX512/bfloat16 support.
+* `/api/health` now reports the active precision & heuristic throughput profile so the UI can surface it in the status bar.
 
 
 ## Concluding note
