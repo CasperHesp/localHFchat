@@ -1,15 +1,16 @@
-import os, time, threading, pathlib
+import os, time, threading, pathlib, asyncio, json, queue
 from typing import List, Optional, Dict, Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 from transformers import StoppingCriteria, StoppingCriteriaList
+from transformers import TextIteratorStreamer
 try:
     from transformers import BitsAndBytesConfig
 except ImportError:  # pragma: no cover - optional dependency at runtime
@@ -287,8 +288,22 @@ class TimeLimitCriteria(StoppingCriteria):
         self.start_t = start_t
         safe = max(5.0, float(limit_s))
         self.limit_s = min(safe, 240.0)  # guardrail
+        self.triggered = False
     def __call__(self, input_ids, scores, **kwargs):
-        return (time.time() - self.start_t) >= self.limit_s
+        if (time.time() - self.start_t) >= self.limit_s:
+            self.triggered = True
+            return True
+        return False
+
+
+class CancelCriteria(StoppingCriteria):
+    def __init__(self, event: threading.Event):
+        self.event = event
+        self.triggered = False
+
+    def __call__(self, input_ids, scores, **kwargs):
+        self.triggered = self.event.is_set()
+        return self.triggered
 
 # ====== Model ======
 _MODEL_LOCK = threading.Lock()
@@ -655,8 +670,8 @@ def health():
         "profile": profile,
     }
 
-@app.post("/api/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
+@app.post("/api/chat")
+async def chat(req: ChatRequest, request: Request):
     if not req.messages:
         raise HTTPException(status_code=400, detail="messages may not be empty")
     ensure_ready()
@@ -698,9 +713,36 @@ def chat(req: ChatRequest):
     mode_time = float(mode_meta.get("max_time_s", DEFAULT_MAX_TIME_S))
     max_time = max(5.0, min(requested_time, mode_time))
     t0 = time.time()
-    stop_list = StoppingCriteriaList([TimeLimitCriteria(t0, max_time)])
+    cancel_event = threading.Event()
+    time_limit = TimeLimitCriteria(t0, max_time)
+    cancel_criteria = CancelCriteria(cancel_event)
+    stop_list = StoppingCriteriaList([time_limit, cancel_criteria])
 
-    params = dict(
+    inputs = _TOKENIZER(prompt, return_tensors="pt")
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs.get("attention_mask")
+
+    model_device = getattr(_PIPE.model, "device", None)
+    device_map = getattr(_PIPE.model, "hf_device_map", None)
+    try:
+        if model_device is not None and not device_map:
+            input_ids = input_ids.to(model_device)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(model_device)
+        else:
+            input_ids = input_ids.to(DEVICE)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(DEVICE)
+    except Exception:
+        input_ids = input_ids.to(DEVICE)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(DEVICE)
+
+    streamer = TextIteratorStreamer(_TOKENIZER, skip_prompt=True, skip_special_tokens=True)
+
+    generation_kwargs = dict(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
         max_new_tokens=max_new,
         do_sample=do_sample,
         temperature=temperature,
@@ -711,30 +753,115 @@ def chat(req: ChatRequest):
         eos_token_id=eos,
         pad_token_id=pad,
         early_stopping=True,
-        return_full_text=False,
         use_cache=True,
-        stopping_criteria=stop_list
+        streamer=streamer,
+        stopping_criteria=stop_list,
+        return_dict_in_generate=False,
     )
 
-    out = _PIPE(prompt, **params)[0]["generated_text"]
-    dt_ms = int((time.time() - t0) * 1000)
+    if attention_mask is None:
+        generation_kwargs.pop("attention_mask")
 
-    # Heuristic: detect if we hit the time limit
-    stop_reason = "timeout" if (time.time() - t0) >= max_time - 0.01 else "eos_or_len"
+    generation_error: Dict[str, Exception] = {}
 
-    content = out.strip()
-    try:
-        tokens = len(_TOKENIZER(content, add_special_tokens=False).input_ids)
-    except Exception:
-        tokens = len(content.split())
-    return ChatResponse(
-        content=content,
-        model_id=MODEL_ID,
-        generated_tokens=tokens,
-        time_ms=dt_ms,
-        stop_reason=stop_reason,
-        mode=mode_key,
-    )
+    def _generate():
+        try:
+            with torch.inference_mode():
+                _PIPE.model.generate(**generation_kwargs)
+        except Exception as exc:
+            generation_error["error"] = exc
+            try:
+                streamer.put(None)
+            except Exception:
+                pass
+
+    gen_thread = threading.Thread(target=_generate, daemon=True)
+    gen_thread.start()
+
+    async def _token_stream():
+        accumulated: List[str] = []
+        end_sent = False
+        try:
+            while True:
+                if await request.is_disconnected():
+                    cancel_event.set()
+                try:
+                    token = await asyncio.to_thread(streamer.text_queue.get, True, 0.1)
+                except TypeError:
+                    # Python <3.11 compatibility: fallback to kwargs
+                    try:
+                        token = await asyncio.to_thread(streamer.text_queue.get, timeout=0.1)
+                    except queue.Empty:
+                        if not gen_thread.is_alive() and streamer.end_of_stream:
+                            break
+                        if cancel_event.is_set() and not gen_thread.is_alive():
+                            break
+                        continue
+                except queue.Empty:
+                    if not gen_thread.is_alive() and streamer.end_of_stream:
+                        break
+                    if cancel_event.is_set() and not gen_thread.is_alive():
+                        break
+                    continue
+
+                if token is None:
+                    break
+
+                accumulated.append(token)
+                payload = json.dumps({"type": "token", "token": token}) + "\n"
+                yield payload.encode("utf-8")
+
+            if gen_thread.is_alive():
+                gen_thread.join(timeout=0.1)
+
+            dt_ms = int((time.time() - t0) * 1000)
+            if generation_error.get("error") is not None:
+                err = generation_error["error"]
+                payload = json.dumps({"type": "error", "error": str(err), "time_ms": dt_ms}) + "\n"
+                end_sent = True
+                yield payload.encode("utf-8")
+                return
+
+            content_text = "".join(accumulated).strip()
+            try:
+                token_count = len(_TOKENIZER(content_text, add_special_tokens=False).input_ids)
+            except Exception:
+                token_count = len(content_text.split())
+
+            if cancel_criteria.triggered or cancel_event.is_set():
+                stop_reason = "cancelled"
+            elif time_limit.triggered:
+                stop_reason = "timeout"
+            else:
+                stop_reason = "eos_or_len"
+
+            final_payload = json.dumps(
+                {
+                    "type": "end",
+                    "content": content_text,
+                    "model_id": MODEL_ID,
+                    "generated_tokens": token_count,
+                    "time_ms": dt_ms,
+                    "stop_reason": stop_reason,
+                    "mode": mode_key,
+                }
+            ) + "\n"
+            end_sent = True
+            yield final_payload.encode("utf-8")
+        finally:
+            cancel_event.set()
+            if gen_thread.is_alive():
+                try:
+                    gen_thread.join(timeout=0.1)
+                except Exception:
+                    pass
+            if not end_sent and generation_error.get("error") is not None:
+                # Ensure the client is notified even if exceptions occur during cleanup
+                err = generation_error["error"]
+                payload = json.dumps({"type": "error", "error": str(err)}) + "\n"
+                yield payload.encode("utf-8")
+
+    return StreamingResponse(_token_stream(), media_type="application/x-ndjson")
 
 class SummarizeRequest(BaseModel):
     messages: List[Message]
