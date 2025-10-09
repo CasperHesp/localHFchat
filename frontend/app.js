@@ -468,7 +468,7 @@ async function checkHealthLoop() {
   try {
     const res = await fetch('/api/health');
     const j = await res.json();
-    state.health = { ...(state.health || {}), ...j, error: null };
+    state.health = { ...(state.health || {}), ...j, error: j.last_error || null };
     if (j.profile) {
       state.profile = j.profile;
     }

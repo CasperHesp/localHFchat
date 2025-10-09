@@ -326,6 +326,8 @@ class CancelCriteria(StoppingCriteria):
 
 # ====== Model ======
 _MODEL_LOCK = threading.Lock()
+_WARM_LOCK = threading.Lock()
+_WARM_THREAD: Optional[threading.Thread] = None
 _PIPE = None
 _TOKENIZER = None
 _READY = False
@@ -818,6 +820,8 @@ def _auto_max_new_tokens(prompt: str) -> int:
 # ====== API ======
 @app.get("/api/health")
 def health():
+    if not _READY:
+        _launch_background_warmup()
     profile = dict(PROFILE_INFO)
     defaults = dict(profile.get("defaults", {}))
     profile_modes = {}
@@ -1099,7 +1103,7 @@ def memory_read():
 
 @app.on_event("startup")
 def _warm():
-    threading.Thread(target=lambda: ensure_ready(), daemon=True).start()
+    _launch_background_warmup()
 
 # Static & root
 if STATIC_DIR.exists():
