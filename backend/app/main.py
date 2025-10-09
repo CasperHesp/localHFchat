@@ -463,7 +463,7 @@ def _should_quantize(cpu_cap: str, cpu_bf16: bool, vram_gb: Optional[float]) -> 
     return False
 
 
-def _infer_profile() -> Dict[str, Optional[float]]:
+def _runtime_profile() -> Dict[str, Optional[float]]:
     precision = _ACTIVE_PRECISION
     if precision == "4bit":
         est_tps = 18.0
@@ -874,7 +874,7 @@ def health():
         "mps": IS_MPS,
         "quantization": MODEL_QUANTIZATION,
         "precision": _ACTIVE_PRECISION,
-        "profile": _infer_profile(),
+        "runtime_profile": _runtime_profile(),
         "dtype": str(DTYPE),
         "threads": _NUM_THREADS,
         "mps": IS_MPS,
