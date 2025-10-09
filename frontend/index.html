@@ -60,6 +60,34 @@
       </aside>
 
       <main class="main">
+        <div class="status-bar">
+          <div class="status-indicator" id="statusIndicator">
+            <span class="status-dot"></span>
+            <span id="statusText">Checking model…</span>
+          </div>
+          <div class="status-block">
+            <span class="status-label">Model</span>
+            <span class="status-value" id="statusModel">—</span>
+          </div>
+          <div class="status-block">
+            <span class="status-label">Device</span>
+            <span class="status-value" id="statusDevice">—</span>
+          </div>
+          <div class="status-block">
+            <span class="status-label">Token budget</span>
+            <span class="status-value" id="statusBudget">—</span>
+          </div>
+          <div class="status-block mode">
+            <label for="perfMode">LLM mode</label>
+            <select id="perfMode">
+              <option value="fast" data-emoji="🚀">🚀 Fast</option>
+              <option value="balanced" data-emoji="⚖️">⚖️ Balanced</option>
+              <option value="quality" data-emoji="🎯">🎯 Quality</option>
+            </select>
+            <small id="modeHint">Adjusts response length and latency.</small>
+          </div>
+        </div>
+
         <div id="chat" class="chat"></div>
 
         <!-- Typing indicator -->

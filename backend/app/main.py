@@ -1,5 +1,5 @@
 import os, time, threading, pathlib
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,15 +22,166 @@ if MODEL_QUANTIZATION not in {"auto", "full", "4bit"}:
     MODEL_QUANTIZATION = "auto"
 MIN_FULL_PRECISION_VRAM_GB = float(os.environ.get("MIN_FULL_PRECISION_VRAM_GB", "8"))
 IS_MPS = torch.backends.mps.is_available()
-DEVICE = torch.device("mps") if IS_MPS else torch.device("cpu")
-DTYPE = torch.float16 if IS_MPS else torch.float32
-torch.set_num_threads(int(os.environ.get("NUM_THREADS", str(max(1, (os.cpu_count() or 4) - 1)))))
+IS_CUDA = torch.cuda.is_available()
+
+if IS_CUDA:
+    DEVICE = torch.device("cuda")
+    DEVICE_TYPE = "cuda"
+elif IS_MPS:
+    DEVICE = torch.device("mps")
+    DEVICE_TYPE = "mps"
+else:
+    DEVICE = torch.device("cpu")
+    DEVICE_TYPE = "cpu"
+
+if IS_CUDA or IS_MPS:
+    DTYPE = torch.float16
+else:
+    # Prefer bfloat16 when supported, else fall back to float32
+    has_bf16 = getattr(torch.backends.cpu, "has_bfloat16", False)
+    DTYPE = torch.bfloat16 if has_bf16 else torch.float32
+
+_NUM_THREADS = int(os.environ.get("NUM_THREADS", str(max(1, (os.cpu_count() or 4) - 1))))
+torch.set_num_threads(_NUM_THREADS)
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
-# Global time cap (can be overridden per request)
-DEFAULT_MAX_TIME_S = float(os.environ.get("GENERATION_MAX_TIME_S", "200.0"))
 
-DEFAULT_SYS = "You are a helpful brokerage assistant, proactively helping Brainbay and their affiliates. You are an optimist by nature: when there appears to be doubt, you try to infer what could be useful and you make useful suggestions for next steps."
+def _env_flag(name: str, default: str = "1") -> bool:
+    val = os.environ.get(name, default)
+    return str(val).strip().lower() not in {"0", "false", "off", "no"}
+
+
+OPTIMIZATION_INFO = {
+    "device_type": DEVICE_TYPE,
+    "dtype": str(DTYPE),
+    "quantization": "none",
+    "bettertransformer": False,
+    "compiled": False,
+    "matmul_precision": None,
+    "interop_threads": None,
+}
+
+# ====== Dynamic inference profile ======
+def _infer_profile(model_id: str) -> Dict[str, Any]:
+    mid = (model_id or "").lower()
+    hint = os.environ.get("MODEL_PROFILE", "").lower().strip()
+
+    profiles = {
+        "cpu-small": {
+            "name": "cpu-small",
+            "model_size": "sub-1B",
+            "defaults": {
+                "temperature": 0.35,
+                "top_p": 0.92,
+                "repetition_penalty": 1.05,
+                "no_repeat_ngram_size": 3,
+                "top_k": 40,
+                "max_new_tokens": 384,
+                "max_new_cap": 512,
+                "max_time_s": 75.0,
+                "default_mode": "balanced",
+            },
+        },
+        "gpu-medium": {
+            "name": "gpu-medium",
+            "model_size": "1B-5B",
+            "defaults": {
+                "temperature": 0.3,
+                "top_p": 0.95,
+                "repetition_penalty": 1.05,
+                "no_repeat_ngram_size": 3,
+                "top_k": 40,
+                "max_new_tokens": 640,
+                "max_new_cap": 1024,
+                "max_time_s": 110.0,
+                "default_mode": "balanced",
+            },
+        },
+    }
+
+    if hint in profiles:
+        profile = profiles[hint]
+    elif "0.5b" in mid or "500m" in mid or "0_5b" in mid:
+        profile = profiles["cpu-small"]
+    elif IS_CUDA or IS_MPS:
+        profile = profiles["gpu-medium"]
+    else:
+        profile = profiles["cpu-small"]
+
+    max_cap = profile["defaults"].get("max_new_cap", profile["defaults"].get("max_new_tokens", 512))
+    balanced = profile["defaults"].get("max_new_tokens", 512)
+
+    def _cap(val: float) -> int:
+        return max(64, min(int(val), max_cap))
+
+    profile["modes"] = {
+        "fast": {
+            "label": "Fast",
+            "description": "Shorter replies and tighter time cap for responsiveness.",
+            "max_new_tokens": _cap(balanced * 0.6),
+            "max_time_s": max(25.0, profile["defaults"].get("max_time_s", 75.0) * 0.65),
+            "temperature": max(0.0, profile["defaults"].get("temperature", 0.3) - 0.05),
+            "top_p": min(0.98, profile["defaults"].get("top_p", 0.95) + 0.0),
+        },
+        "balanced": {
+            "label": "Balanced",
+            "description": "Default blend of speed and depth.",
+            "max_new_tokens": balanced,
+            "max_time_s": profile["defaults"].get("max_time_s", 90.0),
+            "temperature": profile["defaults"].get("temperature", 0.3),
+            "top_p": profile["defaults"].get("top_p", 0.95),
+        },
+        "quality": {
+            "label": "Quality",
+            "description": "Longer answers and higher time limit for deeper dives.",
+            "max_new_tokens": _cap(balanced * 1.3),
+            "max_time_s": min(float(max_cap) / 3.0, profile["defaults"].get("max_time_s", 90.0) * 1.4),
+            "temperature": min(0.9, profile["defaults"].get("temperature", 0.3) + 0.05),
+            "top_p": min(0.99, profile["defaults"].get("top_p", 0.95) + 0.02),
+        },
+    }
+
+    return profile
+
+
+PROFILE_INFO = _infer_profile(MODEL_ID)
+PROFILE_DEFAULTS = PROFILE_INFO.get("defaults", {})
+
+DEFAULT_TEMPERATURE = float(os.environ.get("GENERATION_TEMPERATURE", PROFILE_DEFAULTS.get("temperature", 0.3)))
+DEFAULT_TOP_P = float(os.environ.get("GENERATION_TOP_P", PROFILE_DEFAULTS.get("top_p", 0.95)))
+DEFAULT_REPETITION_PENALTY = float(
+    os.environ.get("GENERATION_REPETITION_PENALTY", PROFILE_DEFAULTS.get("repetition_penalty", 1.05))
+)
+DEFAULT_NO_REPEAT_NGRAM = int(
+    os.environ.get("GENERATION_NO_REPEAT_NGRAM", PROFILE_DEFAULTS.get("no_repeat_ngram_size", 3))
+)
+DEFAULT_TOP_K = int(os.environ.get("GENERATION_TOP_K", PROFILE_DEFAULTS.get("top_k", 40)))
+DEFAULT_MAX_NEW_TOKENS = int(
+    os.environ.get("GENERATION_MAX_NEW_TOKENS", PROFILE_DEFAULTS.get("max_new_tokens", 512))
+)
+MAX_NEW_CAP = int(PROFILE_DEFAULTS.get("max_new_cap", max(DEFAULT_MAX_NEW_TOKENS, 512)))
+DEFAULT_MODE = PROFILE_DEFAULTS.get("default_mode", "balanced")
+DEFAULT_MAX_TIME_S = float(
+    os.environ.get("GENERATION_MAX_TIME_S", PROFILE_DEFAULTS.get("max_time_s", 200.0))
+)
+
+DEFAULT_SYS = (
+    "You are a helpful brokerage assistant, proactively helping Brainbay and their affiliates. You are an optimist by\n"
+    "nature: when there appears to be doubt, you try to infer what could be useful and you make useful suggestions for next steps."
+)
+
+PROFILE_INFO.update(
+    {
+        "device": str(DEVICE),
+        "dtype": str(DTYPE),
+        "threads": _NUM_THREADS,
+        "mps": IS_MPS,
+        "cuda": IS_CUDA,
+    }
+)
+PROFILE_INFO.setdefault("optimizations", dict(OPTIMIZATION_INFO))
+
+MODEL_CTX_LIMIT = int(PROFILE_INFO.get("max_context_tokens", 2048))
 
 # ====== App ======
 app = FastAPI(title="HF Local Chat API (timeouts patch)", version="0.2.0")
@@ -101,17 +252,18 @@ class Message(BaseModel):
 class ChatRequest(BaseModel):
     messages: List[Message]
     # tuned defaults (hidden from UI)
-    temperature: float = 0.3
-    top_p: float = 0.95
-    repetition_penalty: float = 1.05
+    temperature: float = DEFAULT_TEMPERATURE
+    top_p: float = DEFAULT_TOP_P
+    repetition_penalty: float = DEFAULT_REPETITION_PENALTY
     deterministic: bool = False
     max_new_tokens: Optional[int] = None
-    no_repeat_ngram_size: int = 3
+    no_repeat_ngram_size: int = DEFAULT_NO_REPEAT_NGRAM
     max_time_s: float = DEFAULT_MAX_TIME_S
     context_key: Optional[str] = "market"
     refine: Optional[str] = "model"
     refine_iters: int = 1
     use_memory: bool = False
+    performance_mode: str = DEFAULT_MODE
 
 class ChatResponse(BaseModel):
     content: str
@@ -119,6 +271,7 @@ class ChatResponse(BaseModel):
     generated_tokens: int
     time_ms: int
     stop_reason: Optional[str] = None
+    mode: Optional[str] = None
 
 class SummarizeRequest(BaseModel):
     messages: List[Message]
@@ -132,7 +285,8 @@ class SummarizeResponse(BaseModel):
 class TimeLimitCriteria(StoppingCriteria):
     def __init__(self, start_t: float, limit_s: float):
         self.start_t = start_t
-        self.limit_s = max(3.0, min(60.0, float(limit_s)))  # clamp for safety
+        safe = max(5.0, float(limit_s))
+        self.limit_s = min(safe, 240.0)  # guardrail
     def __call__(self, input_ids, scores, **kwargs):
         return (time.time() - self.start_t) >= self.limit_s
 
@@ -222,42 +376,151 @@ def _infer_profile() -> Dict[str, Optional[float]]:
     return profile
 
 def _load_pipeline(model_id: str):
-    global _PIPE, _TOKENIZER, _READY, _LAST_ERROR, _ACTIVE_PRECISION, _HARDWARE_STATE
+    global _PIPE, _TOKENIZER, _READY, _LAST_ERROR, MODEL_CTX_LIMIT, MAX_NEW_CAP, OPTIMIZATION_INFO
     try:
-        cpu_cap = _detect_cpu_capability()
-        cpu_bf16 = _cpu_supports_bf16()
-        vram_gb = _detect_vram_gb()
-        quantize = _should_quantize(cpu_cap, cpu_bf16, vram_gb)
-
-        load_kwargs = dict(
-            trust_remote_code=True,
-            low_cpu_mem_usage=True,
-            use_safetensors=True,
-        )
-
-        if quantize:
-            _ACTIVE_PRECISION = "4bit"
-            compute_dtype = torch.float16 if DTYPE == torch.float16 else torch.float32
-            if BitsAndBytesConfig is not None:
-                load_kwargs["quantization_config"] = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_compute_dtype=compute_dtype,
-                    bnb_4bit_use_double_quant=True,
-                    bnb_4bit_quant_type="nf4",
-                )
-            else:
-                load_kwargs["load_in_4bit"] = True
-            if torch.cuda.is_available() or IS_MPS:
-                load_kwargs["device_map"] = "auto"
-        else:
-            _ACTIVE_PRECISION = "full"
-            load_kwargs["torch_dtype"] = DTYPE
-
         tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, use_fast=True)
-        model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
-        model.eval()
-        if not quantize:
+
+        optimization = {
+            "device_type": DEVICE_TYPE,
+            "dtype": str(DTYPE),
+            "quantization": "none",
+            "bettertransformer": False,
+            "compiled": False,
+            "matmul_precision": None,
+            "interop_threads": None,
+        }
+
+        if DEVICE_TYPE == "cpu":
+            matmul_precision = os.environ.get("TORCH_FLOAT32_MATMUL_PRECISION", "medium")
+            try:
+                torch.set_float32_matmul_precision(matmul_precision)
+                optimization["matmul_precision"] = matmul_precision
+            except Exception as err:
+                print(f"[startup] torch.set_float32_matmul_precision failed: {err}", flush=True)
+            interop_env = os.environ.get("NUM_INTEROP_THREADS")
+            try:
+                interop_threads = int(interop_env) if interop_env is not None else _NUM_THREADS
+            except ValueError:
+                print(
+                    f"[startup] Invalid NUM_INTEROP_THREADS={interop_env!r}, using {_NUM_THREADS}",
+                    flush=True,
+                )
+                interop_threads = _NUM_THREADS
+            if hasattr(torch, "set_num_interop_threads"):
+                try:
+                    torch.set_num_interop_threads(max(1, interop_threads))
+                    optimization["interop_threads"] = max(1, interop_threads)
+                except Exception as err:
+                    print(f"[startup] torch.set_num_interop_threads failed: {err}", flush=True)
+
+        quantization_candidates: List[str] = []
+        if DEVICE_TYPE == "cuda" and BitsAndBytesConfig is not None and _env_flag("ENABLE_BNB_QUANTIZATION", "1"):
+            preferred = os.environ.get("QUANTIZATION_MODE", "4bit").strip().lower()
+            if preferred in {"4bit", "8bit"}:
+                quantization_candidates = [preferred, "8bit" if preferred == "4bit" else "4bit"]
+            else:
+                quantization_candidates = ["4bit", "8bit"]
+
+        model = None
+        quantization_error: Optional[Exception] = None
+        for mode in quantization_candidates:
+            try:
+                if mode == "4bit":
+                    quant_config = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_compute_dtype=torch.float16,
+                        bnb_4bit_use_double_quant=True,
+                        bnb_4bit_quant_type="nf4",
+                    )
+                elif mode == "8bit":
+                    quant_config = BitsAndBytesConfig(load_in_8bit=True)
+                else:
+                    continue
+
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_id,
+                    trust_remote_code=True,
+                    low_cpu_mem_usage=True,
+                    use_safetensors=True,
+                    quantization_config=quant_config,
+                    device_map="auto",
+                )
+                optimization["quantization"] = f"bnb-{mode}"
+                break
+            except (ValueError, FileNotFoundError, OSError) as err:
+                quantization_error = err
+                print(
+                    f"[startup] Quantized load ({mode}) unavailable, will retry/fallback: {err}",
+                    flush=True,
+                )
+                model = None
+            except Exception as err:
+                quantization_error = err
+                print(f"[startup] Quantized load ({mode}) failed: {err}", flush=True)
+                model = None
+
+        if model is None:
+            if quantization_candidates and quantization_error is not None:
+                print("[startup] Falling back to full-precision weights.", flush=True)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                trust_remote_code=True,
+                torch_dtype=DTYPE,
+                low_cpu_mem_usage=True,
+                use_safetensors=True,
+            )
             model.to(DEVICE)
+
+        model.eval()
+
+        if _env_flag("ENABLE_BETTERTRANSFORMER", "1") and hasattr(model, "to_bettertransformer"):
+            try:
+                model = model.to_bettertransformer()
+                optimization["bettertransformer"] = True
+            except Exception as err:
+                print(f"[startup] to_bettertransformer() failed: {err}", flush=True)
+
+        def _torch_version_at_least(major: int, minor: int) -> bool:
+            ver_str = torch.__version__.split("+")[0]
+            parts = ver_str.split(".")
+            try:
+                ver_nums = [int(p) for p in parts[:3]]
+            except ValueError:
+                ver_nums = [0, 0, 0]
+            ver_nums += [0] * (3 - len(ver_nums))
+            return (ver_nums[0], ver_nums[1]) >= (major, minor)
+
+        if (
+            _env_flag("ENABLE_TORCH_COMPILE", "0")
+            and hasattr(torch, "compile")
+            and _torch_version_at_least(2, 1)
+            and optimization.get("quantization") == "none"
+        ):
+            try:
+                model = torch.compile(model)
+                optimization["compiled"] = True
+            except Exception as err:
+                print(f"[startup] torch.compile failed: {err}", flush=True)
+
+        OPTIMIZATION_INFO = optimization
+        PROFILE_INFO["optimizations"] = dict(optimization)
+        ctx_limit = int(getattr(model.config, "max_position_embeddings", MODEL_CTX_LIMIT))
+        MODEL_CTX_LIMIT = ctx_limit
+        ctx_cap = max(128, ctx_limit - 128)
+        MAX_NEW_CAP = min(MAX_NEW_CAP, ctx_cap)
+        PROFILE_INFO["max_context_tokens"] = ctx_limit
+        PROFILE_INFO.setdefault("defaults", PROFILE_DEFAULTS)
+        PROFILE_INFO["defaults"]["max_new_cap"] = MAX_NEW_CAP
+        PROFILE_INFO["defaults"]["max_new_tokens"] = min(
+            PROFILE_INFO["defaults"].get("max_new_tokens", DEFAULT_MAX_NEW_TOKENS), MAX_NEW_CAP
+        )
+        for meta in PROFILE_INFO.get("modes", {}).values():
+            if not isinstance(meta, dict):
+                continue
+            if "max_new_tokens" in meta:
+                meta["max_new_tokens"] = int(min(meta["max_new_tokens"], MAX_NEW_CAP))
+            if "max_time_s" in meta:
+                meta["max_time_s"] = float(max(5.0, meta["max_time_s"]))
 
         # Ensure eos/pad are set to avoid hanging on some models
         if model.config.eos_token_id is None and tok.eos_token_id is not None:
@@ -347,20 +610,33 @@ def _format_dialog(messages: List[Message], key: Optional[str], use_memory: bool
         return "\n".join(parts)
 
 def _auto_max_new_tokens(prompt: str) -> int:
-    try:
-        max_ctx = int(getattr(_PIPE.model.config, "max_position_embeddings", 2048))
-    except Exception:
-        max_ctx = 2048
+    max_ctx = MODEL_CTX_LIMIT or 2048
     try:
         prompt_len = len(_TOKENIZER(prompt, add_special_tokens=False).input_ids)
     except Exception:
         prompt_len = 512
-    budget = max_ctx - prompt_len - 16
-    return max(64, min(1024, budget))
+    budget = max_ctx - prompt_len - 32
+    return max(64, min(MAX_NEW_CAP, budget))
 
 # ====== API ======
 @app.get("/api/health")
 def health():
+    profile = dict(PROFILE_INFO)
+    defaults = dict(profile.get("defaults", {}))
+    profile_modes = {}
+    for key, meta in profile.get("modes", {}).items():
+        if isinstance(meta, dict):
+            profile_modes[key] = {
+                k: meta[k]
+                for k in ["label", "description", "max_new_tokens", "max_time_s", "temperature", "top_p"]
+                if k in meta
+            }
+    profile["defaults"] = defaults
+    profile["modes"] = profile_modes
+    profile.setdefault("max_context_tokens", MODEL_CTX_LIMIT)
+    profile.setdefault("default_mode", DEFAULT_MODE)
+    if "optimizations" not in profile:
+        profile["optimizations"] = dict(OPTIMIZATION_INFO)
     return {
         "ok": True,
         "model_id": MODEL_ID,
@@ -371,14 +647,13 @@ def health():
         "quantization": MODEL_QUANTIZATION,
         "precision": _ACTIVE_PRECISION,
         "profile": _infer_profile(),
+        "dtype": str(DTYPE),
+        "threads": _NUM_THREADS,
+        "mps": IS_MPS,
+        "cuda": IS_CUDA,
+        "optimizations": dict(OPTIMIZATION_INFO),
+        "profile": profile,
     }
-
-class ChatResponse(BaseModel):
-    content: str
-    model_id: str
-    generated_tokens: int
-    time_ms: int
-    stop_reason: Optional[str] = None
 
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
@@ -390,28 +665,49 @@ def chat(req: ChatRequest):
     eos = getattr(_TOKENIZER, "eos_token_id", None)
     pad = getattr(_TOKENIZER, "pad_token_id", eos)
 
+    mode_key = (req.performance_mode or DEFAULT_MODE or "balanced").lower().strip()
+    mode_meta = PROFILE_INFO.get("modes", {}).get(mode_key) or PROFILE_INFO.get("modes", {}).get(DEFAULT_MODE, {})
+
+    mode_max_tokens = int(mode_meta.get("max_new_tokens", DEFAULT_MAX_NEW_TOKENS))
+    mode_max_tokens = max(8, min(mode_max_tokens, MAX_NEW_CAP))
     if req.max_new_tokens is None or req.max_new_tokens <= 0:
         max_new = _auto_max_new_tokens(prompt)
     else:
-        max_new = max(8, min(req.max_new_tokens, 1024))
+        max_new = max(8, int(req.max_new_tokens))
+    max_new = max(8, min(max_new, mode_max_tokens))
 
     # Deterministic mode optional; else tuned sampling
     do_sample = not req.deterministic
-    temperature = 0.0 if req.deterministic else max(0.0, req.temperature)
-    top_p = 1.0 if req.deterministic else max(0.0, min(req.top_p, 1.0))
+    if req.deterministic:
+        temperature = 0.0
+        top_p = 1.0
+    else:
+        base_temp = max(0.0, req.temperature if req.temperature is not None else DEFAULT_TEMPERATURE)
+        base_top_p = max(0.0, min(req.top_p if req.top_p is not None else DEFAULT_TOP_P, 1.0))
+        temperature = max(0.0, mode_meta.get("temperature", base_temp))
+        top_p = max(0.0, min(mode_meta.get("top_p", base_top_p), 1.0))
+
+    top_k = int(mode_meta.get("top_k", DEFAULT_TOP_K))
+    repetition_penalty = float(req.repetition_penalty or DEFAULT_REPETITION_PENALTY)
+    repetition_penalty = max(1.0, mode_meta.get("repetition_penalty", repetition_penalty))
+    no_repeat = int(req.no_repeat_ngram_size or DEFAULT_NO_REPEAT_NGRAM)
+    no_repeat = max(1, int(mode_meta.get("no_repeat_ngram_size", no_repeat)))
 
     # Time limit stopping criteria
+    requested_time = float(req.max_time_s or DEFAULT_MAX_TIME_S)
+    mode_time = float(mode_meta.get("max_time_s", DEFAULT_MAX_TIME_S))
+    max_time = max(5.0, min(requested_time, mode_time))
     t0 = time.time()
-    stop_list = StoppingCriteriaList([TimeLimitCriteria(t0, req.max_time_s or DEFAULT_MAX_TIME_S)])
+    stop_list = StoppingCriteriaList([TimeLimitCriteria(t0, max_time)])
 
     params = dict(
         max_new_tokens=max_new,
         do_sample=do_sample,
         temperature=temperature,
         top_p=top_p,
-        top_k=40,
-        repetition_penalty=max(1.0, req.repetition_penalty),
-        no_repeat_ngram_size=max(1, int(req.no_repeat_ngram_size or 3)),
+        top_k=top_k,
+        repetition_penalty=repetition_penalty,
+        no_repeat_ngram_size=no_repeat,
         eos_token_id=eos,
         pad_token_id=pad,
         early_stopping=True,
@@ -424,11 +720,21 @@ def chat(req: ChatRequest):
     dt_ms = int((time.time() - t0) * 1000)
 
     # Heuristic: detect if we hit the time limit
-    stop_reason = "timeout" if (time.time() - t0) >= (req.max_time_s or DEFAULT_MAX_TIME_S) - 0.01 else "eos_or_len"
+    stop_reason = "timeout" if (time.time() - t0) >= max_time - 0.01 else "eos_or_len"
 
     content = out.strip()
-    tokens = len(content.split())
-    return ChatResponse(content=content, model_id=MODEL_ID, generated_tokens=tokens, time_ms=dt_ms, stop_reason=stop_reason)
+    try:
+        tokens = len(_TOKENIZER(content, add_special_tokens=False).input_ids)
+    except Exception:
+        tokens = len(content.split())
+    return ChatResponse(
+        content=content,
+        model_id=MODEL_ID,
+        generated_tokens=tokens,
+        time_ms=dt_ms,
+        stop_reason=stop_reason,
+        mode=mode_key,
+    )
 
 class SummarizeRequest(BaseModel):
     messages: List[Message]
@@ -448,7 +754,17 @@ def summarize(req: SummarizeRequest):
     except Exception:
         prompt = "\n".join([f"[{m['role'].upper()}] {m['content']}" for m in msgs]) + "\n[ASSISTANT] "
     eos = getattr(_TOKENIZER, "eos_token_id", None)
-    out = _PIPE(prompt, max_new_tokens=256, do_sample=False, temperature=0.0, top_p=1.0, repetition_penalty=1.0, eos_token_id=eos, return_full_text=False)[0]["generated_text"]
+    summary_tokens = min(256, max(64, MAX_NEW_CAP // 2))
+    out = _PIPE(
+        prompt,
+        max_new_tokens=summary_tokens,
+        do_sample=False,
+        temperature=0.0,
+        top_p=1.0,
+        repetition_penalty=1.0,
+        eos_token_id=eos,
+        return_full_text=False,
+    )[0]["generated_text"]
     return SummarizeResponse(summary=out.strip())
 
 @app.post("/api/memory/append")
